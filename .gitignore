@@ -1,0 +1,49 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environment
+.env
+.env.local
+
+# Application data
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+logs/*.log
+
+# Frontend
+frontend/node_modules/
+frontend/.output/
+frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime databases
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+
+# Logs
+logs/*
+!logs/.gitkeep
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.output/
+frontend/.vite/
