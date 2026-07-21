@@ -12,6 +12,7 @@ from app.core.prompt import get_system_prompt
 from app.core.task_intent import TaskKind
 from app.skills import SkillCatalog
 from app.tools import build_workspace_tools
+from app.memory import WorkspaceMemoryLoader
 
 WORKSPACE_TOOL_PROMPT = """
 工作区工具规则：
@@ -40,6 +41,10 @@ def build_agent(
         local_backend,
     )
 
+    memory_prompt = WorkspaceMemoryLoader(
+        local_backend.workspace
+    ).render_prompt()
+
     skill_prompt = SkillCatalog(
         local_backend.workspace
     ).render_prompt()
@@ -48,6 +53,9 @@ def build_agent(
         get_system_prompt(task_kind),
         WORKSPACE_TOOL_PROMPT,
     ]
+
+    if memory_prompt:
+        prompt_sections.append(memory_prompt)
 
     if skill_prompt:
         prompt_sections.append(skill_prompt)
