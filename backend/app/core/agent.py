@@ -10,8 +10,8 @@ from app.backends.task_scoped import TaskScopedBackend
 from app.core.model import make_main_model
 from app.core.prompt import get_system_prompt
 from app.core.task_intent import TaskKind
+from app.skills import SkillCatalog
 from app.tools import build_workspace_tools
-
 
 WORKSPACE_TOOL_PROMPT = """
 工作区工具规则：
@@ -40,10 +40,19 @@ def build_agent(
         local_backend,
     )
 
-    system_prompt = (
-        f"{get_system_prompt(task_kind)}\n\n"
-        f"{WORKSPACE_TOOL_PROMPT}"
-    )
+    skill_prompt = SkillCatalog(
+        local_backend.workspace
+    ).render_prompt()
+
+    prompt_sections = [
+        get_system_prompt(task_kind),
+        WORKSPACE_TOOL_PROMPT,
+    ]
+
+    if skill_prompt:
+        prompt_sections.append(skill_prompt)
+
+    system_prompt = "\n\n".join(prompt_sections)
 
     return create_deep_agent(
         model=model or make_main_model(),
