@@ -5,6 +5,12 @@ from pathlib import Path
 
 from app.backends.workspace import Workspace
 
+from collections.abc import Sequence
+
+from app.backends.command_runner import (
+    CommandResult,
+    CommandRunner,
+)
 
 MAX_TEXT_FILE_BYTES = 1_000_000
 
@@ -34,6 +40,7 @@ class LocalShellBackend:
 
     def __init__(self, workspace: Workspace | None = None) -> None:
         self.workspace = workspace or Workspace.from_settings()
+        self.command_runner = CommandRunner(self.workspace)
 
     def list_dir(self, virtual_path: str = "/") -> list[FileEntry]:
         """列出目录的下一层内容。"""
@@ -209,3 +216,18 @@ class LocalShellBackend:
             raise BackendFileError(
                 f"目录只读或禁止写入：/{root_name}"
             )
+
+    def run_command(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: str = "/projects",
+        timeout: float = 300,
+    ) -> CommandResult:
+        """执行一条受控的本地命令。"""
+
+        return self.command_runner.run(
+            argv,
+            cwd=cwd,
+            timeout=timeout,
+        )
