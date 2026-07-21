@@ -9,10 +9,11 @@ from app.backends.local_shell import LocalShellBackend
 from app.backends.task_scoped import TaskScopedBackend
 from app.core.model import make_main_model
 from app.core.prompt import get_system_prompt
+from app.core.subagents import build_analysis_subagent
 from app.core.task_intent import TaskKind
+from app.memory import WorkspaceMemoryLoader
 from app.skills import SkillCatalog
 from app.tools import build_workspace_tools
-from app.memory import WorkspaceMemoryLoader
 
 WORKSPACE_TOOL_PROMPT = """
 工作区工具规则：
@@ -31,10 +32,13 @@ def build_agent(
     *,
     backend: LocalShellBackend | None = None,
     model: BaseChatModel | None = None,
+    subagent_model: BaseChatModel | None = None,
 ) -> Any:
     """组装当前任务使用的最小 DeepAgent。"""
 
     local_backend = backend or LocalShellBackend()
+    main_model = model or make_main_model()
+    analysis_model = subagent_model or main_model
 
     scoped_backend = TaskScopedBackend.for_task(
         task_kind,
@@ -48,6 +52,21 @@ def build_agent(
     skill_prompt = SkillCatalog(
         local_backend.workspace
     ).render_prompt()
+
+    shared_context = "\n\n".join(
+        section
+        for section in [
+            memory_prompt,
+            skill_prompt,
+        ]
+        if section
+    )
+
+    analysis_subagent = build_analysis_subagent(
+        local_backend,
+        analysis_model,
+        shared_context=shared_context,
+    )
 
     prompt_sections = [
         get_system_prompt(task_kind),
@@ -63,12 +82,11 @@ def build_agent(
     system_prompt = "\n\n".join(prompt_sections)
 
     return create_deep_agent(
-        model=model or make_main_model(),
+        model=main_model,
         tools=build_workspace_tools(scoped_backend),
         system_prompt=system_prompt,
+        subagents=[analysis_subagent],
         permissions=[
-            # 本课不让 DeepAgents 内置文件工具操作任何路径。
-            # 项目访问统一经过 workspace_* 自定义工具。
             FilesystemPermission(
                 operations=["read", "write"],
                 paths=["/**"],
