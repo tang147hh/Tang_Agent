@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -27,6 +27,14 @@ class Settings:
     log_dir: Path
     workspace_root: Path
     log_level: str
+    model_provider: str
+    model_name: str
+    model_api_key: str = field(repr=False)
+    model_base_url: str
+    model_temperature: float
+    model_max_tokens: int
+    model_timeout: float
+    model_max_retries: int
 
 
 def load_settings() -> Settings:
@@ -56,4 +64,32 @@ def load_settings() -> Settings:
             )
         ),
         log_level=os.getenv("TANG_AGENT_LOG_LEVEL", "INFO").upper(),
+        model_provider=os.getenv(
+            "TANG_AGENT_MODEL_PROVIDER",
+            "deepseek",
+        ).strip().lower(),
+        model_name=os.getenv(
+            "TANG_AGENT_MODEL_NAME",
+            "deepseek-chat",
+        ).strip(),
+        model_api_key=os.getenv(
+            "TANG_AGENT_MODEL_API_KEY",
+            "",
+        ).strip(),
+        model_base_url=os.getenv(
+            "TANG_AGENT_MODEL_BASE_URL",
+            "",
+        ).strip(),
+        model_temperature=float(
+            os.getenv("TANG_AGENT_MODEL_TEMPERATURE", "0.2")
+        ),
+        model_max_tokens=int(
+            os.getenv("TANG_AGENT_MODEL_MAX_TOKENS", "8192")
+        ),
+        model_timeout=float(
+            os.getenv("TANG_AGENT_MODEL_TIMEOUT", "60")
+        ),
+        model_max_retries=int(
+            os.getenv("TANG_AGENT_MODEL_MAX_RETRIES", "2")
+        ),
     )
