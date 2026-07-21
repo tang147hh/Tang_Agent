@@ -21,7 +21,7 @@ def test_model_settings_are_loaded_from_environment(
     )
     monkeypatch.setenv(
         "TANG_AGENT_MODEL_NAME",
-        "deepseek-chat",
+        "deepseek-v4-pro",
     )
     monkeypatch.setenv(
         "TANG_AGENT_MODEL_API_KEY",
@@ -31,7 +31,7 @@ def test_model_settings_are_loaded_from_environment(
     settings = load_settings()
 
     assert settings.model_provider == "deepseek"
-    assert settings.model_name == "deepseek-chat"
+    assert settings.model_name == "deepseek-v4-pro"
     assert "test-secret-key" not in repr(settings)
 
 
@@ -39,7 +39,7 @@ def test_make_main_model_does_not_call_network() -> None:
     settings = replace(
         load_settings(),
         model_provider="deepseek",
-        model_name="deepseek-chat",
+        model_name="deepseek-v4-pro",
         model_api_key="test-key",
         model_base_url="https://api.deepseek.com",
         model_temperature=0.2,
@@ -51,7 +51,7 @@ def test_make_main_model_does_not_call_network() -> None:
     model = make_main_model(settings)
 
     assert isinstance(model, ChatDeepSeek)
-    assert model.model_name == "deepseek-chat"
+    assert model.model_name == "deepseek-v4-pro"
     assert model.temperature == 0.2
     assert model.max_tokens == 8192
     assert model.streaming is True

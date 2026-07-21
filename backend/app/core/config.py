@@ -70,7 +70,7 @@ def load_settings() -> Settings:
         ).strip().lower(),
         model_name=os.getenv(
             "TANG_AGENT_MODEL_NAME",
-            "deepseek-chat",
+            "deepseek-v4-pro",
         ).strip(),
         model_api_key=os.getenv(
             "TANG_AGENT_MODEL_API_KEY",
