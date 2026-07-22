@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from app.core.task_intent import TaskKind
 from app.core.task_runtime import (
+    TaskEvent,
     TaskSnapshot,
     TaskStatus,
 )
@@ -33,10 +35,11 @@ class SQLiteTaskStore:
             self.path,
             timeout=5,
         )
+
         connection.row_factory = sqlite3.Row
-        connection.execute(
-            "PRAGMA busy_timeout = 5000"
-        )
+
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA foreign_keys = ON")
 
         try:
             yield connection
@@ -46,11 +49,10 @@ class SQLiteTaskStore:
 
     def _initialize(self) -> None:
         with self._connection() as connection:
-            connection.execute(
-                "PRAGMA journal_mode = WAL"
-            )
-            connection.execute(
-                """
+            connection.execute("PRAGMA journal_mode = WAL")
+
+            # 必须先创建主表。
+            connection.execute("""
                 CREATE TABLE IF NOT EXISTS tasks (
                     thread_id TEXT PRIMARY KEY,
                     prompt TEXT NOT NULL,
@@ -61,8 +63,28 @@ class SQLiteTaskStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
-                """
-            )
+                """)
+
+            # 再创建引用 tasks 的事件表。
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (thread_id)
+                        REFERENCES tasks(thread_id)
+                        ON DELETE CASCADE
+                )
+                """)
+
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS
+                    idx_task_events_thread_id_id
+                ON task_events(thread_id, id)
+                """)
 
     def create(
         self,
@@ -193,9 +215,7 @@ class SQLiteTaskStore:
             )
 
             if cursor.rowcount == 0:
-                raise KeyError(
-                    f"任务不存在：{thread_id}"
-                )
+                raise KeyError(f"任务不存在：{thread_id}")
 
             row = connection.execute(
                 """
@@ -222,10 +242,99 @@ class SQLiteTaskStore:
             status=TaskStatus(row["status"]),
             result=row["result"],
             error=row["error"],
-            created_at=datetime.fromisoformat(
-                row["created_at"]
-            ),
-            updated_at=datetime.fromisoformat(
-                row["updated_at"]
-            ),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def append_event(
+        self,
+        *,
+        thread_id: str,
+        kind: str,
+        source: str,
+        payload: dict[str, Any],
+    ) -> TaskEvent:
+        created_at = datetime.now(timezone.utc).isoformat()
+
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO task_events (
+                    thread_id,
+                    kind,
+                    source,
+                    payload_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    kind,
+                    source,
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    created_at,
+                ),
+            )
+
+            row = connection.execute(
+                """
+                SELECT *
+                FROM task_events
+                WHERE id = ?
+                """,
+                (cursor.lastrowid,),
+            ).fetchone()
+
+        return self._event(row)
+
+    def list_events(
+        self,
+        thread_id: str,
+        *,
+        after_id: int = 0,
+        limit: int = 200,
+    ) -> list[TaskEvent]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM task_events
+                WHERE thread_id = ?
+                AND id > ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (
+                    thread_id,
+                    after_id,
+                    limit,
+                ),
+            ).fetchall()
+
+        return [self._event(row) for row in rows]
+
+    @staticmethod
+    def _event(
+        row: sqlite3.Row | None,
+    ) -> TaskEvent:
+        if row is None:
+            raise RuntimeError("任务事件读取失败")
+
+        payload = json.loads(row["payload_json"])
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("任务事件 payload 不是对象")
+
+        return TaskEvent(
+            id=int(row["id"]),
+            thread_id=str(row["thread_id"]),
+            kind=str(row["kind"]),
+            source=str(row["source"]),
+            payload=payload,
+            created_at=datetime.fromisoformat(row["created_at"]),
         )
