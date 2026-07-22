@@ -15,6 +15,10 @@ from app.memory import WorkspaceMemoryLoader
 from app.skills import SkillCatalog
 from app.tools import build_workspace_tools
 
+from langgraph.checkpoint.base import (
+    BaseCheckpointSaver,
+)
+
 WORKSPACE_TOOL_PROMPT = """
 工作区工具规则：
 1. 查看目录使用 workspace_list。
@@ -33,6 +37,7 @@ def build_agent(
     backend: LocalShellBackend | None = None,
     model: BaseChatModel | None = None,
     subagent_model: BaseChatModel | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> Any:
     """组装当前任务使用的最小 DeepAgent。"""
 
@@ -93,4 +98,5 @@ def build_agent(
                 mode="deny",
             ),
         ],
+        checkpointer=checkpointer,
     )

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from threading import RLock
-from typing import Any
+from typing import Any, Protocol
 
 from app.core.task_intent import TaskKind
 
@@ -34,6 +34,43 @@ class TaskSnapshot:
     error: str | None
     created_at: datetime
     updated_at: datetime
+
+class TaskStore(Protocol):
+    """业务任务持久化协议。"""
+
+    def create(
+        self,
+        *,
+        prompt: str,
+        task_kind: TaskKind,
+    ) -> TaskSnapshot:
+        ...
+
+    def get(
+        self,
+        thread_id: str,
+    ) -> TaskSnapshot | None:
+        ...
+
+    def mark_running(
+        self,
+        thread_id: str,
+    ) -> TaskSnapshot:
+        ...
+
+    def complete(
+        self,
+        thread_id: str,
+        result: str,
+    ) -> TaskSnapshot:
+        ...
+
+    def fail(
+        self,
+        thread_id: str,
+        error: str,
+    ) -> TaskSnapshot:
+        ...
 
 
 @dataclass(slots=True)
@@ -191,12 +228,12 @@ def _final_answer(result: Any) -> str:
 def run_agent_task(
     *,
     thread_id: str,
-    registry: TaskRegistry,
+    task_store: TaskStore,
     agent_factory: AgentFactory,
 ) -> None:
     """后台执行 Agent，并把结果写回任务注册表。"""
 
-    task = registry.mark_running(thread_id)
+    task = task_store.mark_running(thread_id)
 
     try:
         agent = agent_factory(task.task_kind)
@@ -209,10 +246,15 @@ def run_agent_task(
                         "content": task.prompt,
                     }
                 ]
-            }
+            },
+            config={
+                "configurable": {
+                    "thread_id": thread_id,
+                }
+            },
         )
 
-        registry.complete(
+        task_store.complete(
             thread_id,
             _final_answer(result),
         )
@@ -223,7 +265,7 @@ def run_agent_task(
         )
 
         # 不把供应商异常、请求细节或潜在凭据返回给客户端。
-        registry.fail(
+        task_store.fail(
             thread_id,
             "任务执行失败，请查看服务日志",
         )

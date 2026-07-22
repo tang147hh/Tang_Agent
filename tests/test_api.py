@@ -7,16 +7,19 @@ from langchain_core.messages import AIMessage
 
 from app.app import create_app
 from app.core.task_intent import TaskKind
-
+from app.core.task_runtime import TaskRegistry
 
 class SuccessfulAgent:
     def invoke(
         self,
         input_data: dict[str, Any],
+        config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         assert input_data["messages"][0]["content"] == (
             "分析项目结构"
         )
+        assert config is not None
+        assert "thread_id" in config["configurable"]
 
         return {
             "messages": [
@@ -29,6 +32,7 @@ class FailingAgent:
     def invoke(
         self,
         input_data: dict[str, Any],
+        config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         raise RuntimeError("internal provider details")
 
@@ -77,7 +81,10 @@ def test_background_failure_is_recorded_safely() -> None:
     ) -> FailingAgent:
         return FailingAgent()
 
-    app = create_app(agent_factory=agent_factory)
+    app = create_app(
+        agent_factory=agent_factory,
+        task_store=TaskRegistry(),
+    )
 
     with TestClient(app) as client:
         response = client.post(

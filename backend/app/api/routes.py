@@ -15,7 +15,7 @@ from app.api.schemas import (
 from app.core.task_intent import classify_task_kind
 from app.core.task_runtime import (
     AgentFactory,
-    TaskRegistry,
+    TaskStore,
     run_agent_task,
 )
 
@@ -38,8 +38,8 @@ def create_task(
     background_tasks: BackgroundTasks,
     request: Request,
 ) -> TaskResponse:
-    registry: TaskRegistry = (
-        request.app.state.task_registry
+    task_store: TaskStore = (
+        request.app.state.task_store
     )
     agent_factory: AgentFactory = (
         request.app.state.agent_factory
@@ -47,7 +47,7 @@ def create_task(
 
     task_kind = classify_task_kind(body.prompt)
 
-    snapshot = registry.create(
+    snapshot = task_store.create(
         prompt=body.prompt,
         task_kind=task_kind,
     )
@@ -55,7 +55,7 @@ def create_task(
     background_tasks.add_task(
         run_agent_task,
         thread_id=snapshot.thread_id,
-        registry=registry,
+        task_store=task_store,
         agent_factory=agent_factory,
     )
 
@@ -70,11 +70,11 @@ def get_task(
     thread_id: str,
     request: Request,
 ) -> TaskResponse:
-    registry: TaskRegistry = (
-        request.app.state.task_registry
+    task_store: TaskStore = (
+        request.app.state.task_store
     )
 
-    snapshot = registry.get(thread_id)
+    snapshot = task_store.get(thread_id)
 
     if snapshot is None:
         raise HTTPException(
