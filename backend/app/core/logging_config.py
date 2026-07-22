@@ -10,11 +10,28 @@ from app.core.config import Settings, load_settings
 _HANDLER_MARKER = "_tang_agent_handler"
 
 
-def _already_configured(logger: logging.Logger) -> bool:
-    return any(
-        getattr(handler, _HANDLER_MARKER, False)
-        for handler in logger.handlers
-    )
+def _configured_log_path(
+    logger: logging.Logger,
+) -> Path | None:
+    for handler in logger.handlers:
+        if not getattr(handler, _HANDLER_MARKER, False):
+            continue
+
+        if isinstance(handler, logging.FileHandler):
+            return Path(handler.baseFilename).resolve()
+
+    return None
+
+
+def _remove_configured_handlers(
+    logger: logging.Logger,
+) -> None:
+    for handler in list(logger.handlers):
+        if not getattr(handler, _HANDLER_MARKER, False):
+            continue
+
+        logger.removeHandler(handler)
+        handler.close()
 
 
 def _mark_handler(handler: logging.Handler) -> logging.Handler:
@@ -30,9 +47,13 @@ def configure_logging(settings: Settings | None = None) -> Path:
 
     log_path = current.log_dir / "backend.log"
     root_logger = logging.getLogger()
+    configured_path = _configured_log_path(root_logger)
 
-    if _already_configured(root_logger):
+    if configured_path == log_path.resolve():
         return log_path
+
+    if configured_path is not None:
+        _remove_configured_handlers(root_logger)
 
     level = getattr(logging, current.log_level, logging.INFO)
     root_logger.setLevel(level)
