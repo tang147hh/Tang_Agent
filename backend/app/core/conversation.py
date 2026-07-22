@@ -13,6 +13,18 @@ class ThreadStatus(StrEnum):
     RUNNING = "running"
     ERROR = "error"
 
+class MessageRole(StrEnum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
+
+class RunStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 @dataclass(frozen=True, slots=True)
 class ProjectSnapshot:
@@ -36,6 +48,25 @@ class ThreadSnapshot:
     created_at: datetime
     updated_at: datetime
 
+@dataclass(frozen=True, slots=True)
+class MessageSnapshot:
+    sequence: int
+    message_id: str
+    thread_id: str
+    run_id: str | None
+    role: MessageRole
+    content: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RunSnapshot:
+    run_id: str
+    thread_id: str
+    status: RunStatus
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
 
 class ProjectThreadStore(Protocol):
     """项目和会话持久化协议。"""
@@ -77,4 +108,64 @@ class ProjectThreadStore(Protocol):
         self,
         project_id: str,
     ) -> list[ThreadSnapshot]:
+        ...
+
+class ConversationStore(
+    ProjectThreadStore,
+    Protocol,
+):
+    """项目、会话、消息和运行持久化协议。"""
+
+    def create_run(
+        self,
+        *,
+        thread_id: str,
+    ) -> RunSnapshot:
+        ...
+
+    def get_run(
+        self,
+        run_id: str,
+    ) -> RunSnapshot | None:
+        ...
+
+    def list_runs(
+        self,
+        thread_id: str,
+    ) -> list[RunSnapshot]:
+        ...
+
+    def mark_run_running(
+        self,
+        run_id: str,
+    ) -> RunSnapshot:
+        ...
+
+    def complete_run(
+        self,
+        run_id: str,
+    ) -> RunSnapshot:
+        ...
+
+    def fail_run(
+        self,
+        run_id: str,
+        error: str,
+    ) -> RunSnapshot:
+        ...
+
+    def append_message(
+        self,
+        *,
+        thread_id: str,
+        role: MessageRole,
+        content: str,
+        run_id: str | None = None,
+    ) -> MessageSnapshot:
+        ...
+
+    def list_messages(
+        self,
+        thread_id: str,
+    ) -> list[MessageSnapshot]:
         ...
