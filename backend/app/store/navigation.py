@@ -6,7 +6,6 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
-
 from app.core.conversation import (
     MessageRole,
     MessageSnapshot,
@@ -328,9 +327,7 @@ class SQLiteProjectThreadStore:
             ).fetchone()
 
             if thread is None:
-                raise KeyError(
-                    f"会话不存在：{thread_id}"
-                )
+                raise KeyError(f"会话不存在：{thread_id}")
 
             try:
                 connection.execute(
@@ -354,9 +351,7 @@ class SQLiteProjectThreadStore:
                     ),
                 )
             except sqlite3.IntegrityError as exc:
-                raise ValueError(
-                    "当前会话已经有正在执行的 Run"
-                ) from exc
+                raise ValueError("当前会话已经有正在执行的 Run") from exc
 
             message_cursor = connection.execute(
                 """
@@ -545,6 +540,119 @@ class SQLiteProjectThreadStore:
             error=None,
         )
 
+    def complete_run_with_message(
+        self,
+        run_id: str,
+        content: str,
+    ) -> tuple[RunSnapshot, MessageSnapshot]:
+        normalized_content = content.strip()
+
+        if not normalized_content:
+            raise ValueError("assistant 消息不能为空")
+
+        message_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self._connection() as connection:
+            run_row = connection.execute(
+                """
+                SELECT *
+                FROM runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+
+            if run_row is None:
+                raise KeyError(f"Run 不存在：{run_id}")
+
+            current_status = RunStatus(run_row["status"])
+
+            if current_status is not RunStatus.RUNNING:
+                raise ValueError(
+                    "只有 running Run 可以完成，"
+                    f"当前状态：{current_status.value}"
+                )
+
+            thread_id = str(run_row["thread_id"])
+
+            message_cursor = connection.execute(
+                """
+                INSERT INTO messages (
+                    message_id,
+                    thread_id,
+                    run_id,
+                    role,
+                    content,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    thread_id,
+                    run_id,
+                    MessageRole.ASSISTANT.value,
+                    normalized_content,
+                    now,
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = ?,
+                    error = NULL,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    RunStatus.COMPLETED.value,
+                    now,
+                    run_id,
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE threads
+                SET status = ?,
+                    updated_at = ?
+                WHERE thread_id = ?
+                """,
+                (
+                    ThreadStatus.IDLE.value,
+                    now,
+                    thread_id,
+                ),
+            )
+
+            completed_run_row = connection.execute(
+                """
+                SELECT *
+                FROM runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+
+            message_row = connection.execute(
+                """
+                SELECT *
+                FROM messages
+                WHERE sequence = ?
+                """,
+                (message_cursor.lastrowid,),
+            ).fetchone()
+
+        assert completed_run_row is not None
+        assert message_row is not None
+
+        return (
+            self._run_snapshot(completed_run_row),
+            self._message_snapshot(message_row),
+        )
+
     def fail_run(
         self,
         run_id: str,
@@ -589,13 +697,9 @@ class SQLiteProjectThreadStore:
             ).fetchone()
 
             if current is None:
-                raise KeyError(
-                    f"Run 不存在：{run_id}"
-                )
+                raise KeyError(f"Run 不存在：{run_id}")
 
-            current_status = RunStatus(
-                current["status"]
-            )
+            current_status = RunStatus(current["status"])
 
             allowed_statuses = allowed_transitions.get(
                 current_status,

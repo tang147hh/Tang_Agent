@@ -35,6 +35,7 @@ from app.api.schemas import (
     ThreadCreateRequest,
     ThreadResponse,
 )
+from app.core.conversation_runtime import run_conversation_agent
 from app.core.conversation import ConversationStore
 from app.core.task_intent import classify_task_kind
 from app.core.task_runtime import (
@@ -390,6 +391,7 @@ def get_run(
 
     return RunResponse.model_validate(run)
 
+
 @router.post(
     "/api/threads/{thread_id}/runs",
     response_model=RunStartResponse,
@@ -398,6 +400,7 @@ def get_run(
 def start_thread_run(
     thread_id: str,
     body: RunCreateRequest,
+    background_tasks: BackgroundTasks,
     request: Request,
 ) -> RunStartResponse:
     navigation_store: ConversationStore = (
@@ -421,6 +424,13 @@ def start_thread_run(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
+
+    background_tasks.add_task(
+        run_conversation_agent,
+        run_id=run.run_id,
+        conversation_store=navigation_store,
+        agent_factory=request.app.state.agent_factory,
+    )
 
     return RunStartResponse(
         run=RunResponse.model_validate(run),

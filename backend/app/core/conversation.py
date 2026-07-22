@@ -13,6 +13,7 @@ class ThreadStatus(StrEnum):
     RUNNING = "running"
     ERROR = "error"
 
+
 class MessageRole(StrEnum):
     USER = "user"
     ASSISTANT = "assistant"
@@ -25,6 +26,7 @@ class RunStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
 
 @dataclass(frozen=True, slots=True)
 class ProjectSnapshot:
@@ -48,6 +50,7 @@ class ThreadSnapshot:
     created_at: datetime
     updated_at: datetime
 
+
 @dataclass(frozen=True, slots=True)
 class MessageSnapshot:
     sequence: int
@@ -68,6 +71,7 @@ class RunSnapshot:
     created_at: datetime
     updated_at: datetime
 
+
 class ProjectThreadStore(Protocol):
     """项目和会话持久化协议。"""
 
@@ -76,39 +80,34 @@ class ProjectThreadStore(Protocol):
         *,
         name: str,
         virtual_path: str,
-    ) -> ProjectSnapshot:
-        ...
+    ) -> ProjectSnapshot: ...
 
     def get_project(
         self,
         project_id: str,
-    ) -> ProjectSnapshot | None:
-        ...
+    ) -> ProjectSnapshot | None: ...
 
     def list_projects(
         self,
-    ) -> list[ProjectSnapshot]:
-        ...
+    ) -> list[ProjectSnapshot]: ...
 
     def create_thread(
         self,
         *,
         project_id: str,
         title: str,
-    ) -> ThreadSnapshot:
-        ...
+    ) -> ThreadSnapshot: ...
 
     def get_thread(
         self,
         thread_id: str,
-    ) -> ThreadSnapshot | None:
-        ...
+    ) -> ThreadSnapshot | None: ...
 
     def list_threads(
         self,
         project_id: str,
-    ) -> list[ThreadSnapshot]:
-        ...
+    ) -> list[ThreadSnapshot]: ...
+
 
 class ConversationStore(
     ProjectThreadStore,
@@ -120,8 +119,7 @@ class ConversationStore(
         self,
         *,
         thread_id: str,
-    ) -> RunSnapshot:
-        ...
+    ) -> RunSnapshot: ...
 
     def start_run_with_message(
         self,
@@ -135,33 +133,36 @@ class ConversationStore(
     def get_run(
         self,
         run_id: str,
-    ) -> RunSnapshot | None:
-        ...
+    ) -> RunSnapshot | None: ...
 
     def list_runs(
         self,
         thread_id: str,
-    ) -> list[RunSnapshot]:
-        ...
+    ) -> list[RunSnapshot]: ...
 
     def mark_run_running(
         self,
         run_id: str,
-    ) -> RunSnapshot:
-        ...
+    ) -> RunSnapshot: ...
 
     def complete_run(
         self,
         run_id: str,
-    ) -> RunSnapshot:
+    ) -> RunSnapshot: ...
+
+    def complete_run_with_message(
+        self,
+        run_id: str,
+        content: str,
+    ) -> tuple[RunSnapshot, MessageSnapshot]:
+        """原子保存 assistant 消息并完成 Run。"""
         ...
 
     def fail_run(
         self,
         run_id: str,
         error: str,
-    ) -> RunSnapshot:
-        ...
+    ) -> RunSnapshot: ...
 
     def append_message(
         self,
@@ -170,11 +171,9 @@ class ConversationStore(
         role: MessageRole,
         content: str,
         run_id: str | None = None,
-    ) -> MessageSnapshot:
-        ...
+    ) -> MessageSnapshot: ...
 
     def list_messages(
         self,
         thread_id: str,
-    ) -> list[MessageSnapshot]:
-        ...
+    ) -> list[MessageSnapshot]: ...
