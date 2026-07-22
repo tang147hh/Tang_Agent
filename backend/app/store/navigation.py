@@ -302,6 +302,121 @@ class SQLiteProjectThreadStore:
 
         return [self._thread_snapshot(row) for row in rows]
 
+    def start_run_with_message(
+        self,
+        *,
+        thread_id: str,
+        content: str,
+    ) -> tuple[RunSnapshot, MessageSnapshot]:
+        normalized_content = content.strip()
+
+        if not normalized_content:
+            raise ValueError("消息内容不能为空")
+
+        run_id = str(uuid.uuid4())
+        message_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self._connection() as connection:
+            thread = connection.execute(
+                """
+                SELECT thread_id
+                FROM threads
+                WHERE thread_id = ?
+                """,
+                (thread_id,),
+            ).fetchone()
+
+            if thread is None:
+                raise KeyError(
+                    f"会话不存在：{thread_id}"
+                )
+
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO runs (
+                        run_id,
+                        thread_id,
+                        status,
+                        error,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, NULL, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        thread_id,
+                        RunStatus.PENDING.value,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    "当前会话已经有正在执行的 Run"
+                ) from exc
+
+            message_cursor = connection.execute(
+                """
+                INSERT INTO messages (
+                    message_id,
+                    thread_id,
+                    run_id,
+                    role,
+                    content,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    thread_id,
+                    run_id,
+                    MessageRole.USER.value,
+                    normalized_content,
+                    now,
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE threads
+                SET status = ?,
+                    updated_at = ?
+                WHERE thread_id = ?
+                """,
+                (
+                    ThreadStatus.RUNNING.value,
+                    now,
+                    thread_id,
+                ),
+            )
+
+            run_row = connection.execute(
+                """
+                SELECT *
+                FROM runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+
+            message_row = connection.execute(
+                """
+                SELECT *
+                FROM messages
+                WHERE sequence = ?
+                """,
+                (message_cursor.lastrowid,),
+            ).fetchone()
+
+        return (
+            self._run_snapshot(run_row),
+            self._message_snapshot(message_row),
+        )
+
     def create_run(
         self,
         *,

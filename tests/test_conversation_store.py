@@ -192,3 +192,47 @@ def test_rejects_illegal_run_transition(
         match="非法 Run 状态转换",
     ):
         store.complete_run(run.run_id)
+
+def test_atomically_starts_run_with_user_message(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteProjectThreadStore(
+        tmp_path / "tasks.sqlite"
+    )
+    thread = _create_thread(store)
+
+    run, message = (
+        store.start_run_with_message(
+            thread_id=thread.thread_id,
+            content="  分析项目结构  ",
+        )
+    )
+
+    assert run.status is RunStatus.PENDING
+    assert message.role is MessageRole.USER
+    assert message.content == "分析项目结构"
+    assert message.run_id == run.run_id
+
+    active_thread = store.get_thread(
+        thread.thread_id
+    )
+
+    assert active_thread is not None
+    assert active_thread.status is ThreadStatus.RUNNING
+
+    with pytest.raises(
+        ValueError,
+        match="已经有正在执行",
+    ):
+        store.start_run_with_message(
+            thread_id=thread.thread_id,
+            content="重复运行",
+        )
+
+    # 第二次启动失败后，不能多出 Run 或 Message。
+    assert len(
+        store.list_runs(thread.thread_id)
+    ) == 1
+    assert len(
+        store.list_messages(thread.thread_id)
+    ) == 1

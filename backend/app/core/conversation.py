@@ -123,6 +123,15 @@ class ConversationStore(
     ) -> RunSnapshot:
         ...
 
+    def start_run_with_message(
+        self,
+        *,
+        thread_id: str,
+        content: str,
+    ) -> tuple[RunSnapshot, MessageSnapshot]:
+        """原子创建 Run 和对应的用户消息。"""
+        ...
+
     def get_run(
         self,
         run_id: str,

@@ -138,3 +138,83 @@ def test_missing_conversation_resources_return_404(
     assert messages.status_code == 404
     assert runs.status_code == 404
     assert run.status_code == 404
+
+def test_starts_run_with_user_message(
+    tmp_path: Path,
+) -> None:
+    app, thread, _ = _conversation_app(
+        tmp_path
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            (
+                f"/api/threads/"
+                f"{thread.thread_id}/runs"
+            ),
+            json={
+                "content": "继续增加测试",
+            },
+        )
+
+        assert created.status_code == 202
+
+        payload = created.json()
+
+        assert payload["run"]["status"] == (
+            "pending"
+        )
+        assert payload["message"]["role"] == (
+            "user"
+        )
+        assert payload["message"]["content"] == (
+            "继续增加测试"
+        )
+        assert payload["message"]["run_id"] == (
+            payload["run"]["run_id"]
+        )
+
+        duplicate = client.post(
+            (
+                f"/api/threads/"
+                f"{thread.thread_id}/runs"
+            ),
+            json={
+                "content": "重复提交",
+            },
+        )
+
+        messages = client.get(
+            (
+                f"/api/threads/"
+                f"{thread.thread_id}/messages"
+            )
+        ).json()
+
+    assert duplicate.status_code == 409
+
+    # 原有一轮有两条消息，新 Run 只增加一条用户消息。
+    assert [
+        message["content"]
+        for message in messages
+    ] == [
+        "分析项目结构",
+        "项目结构分析完成",
+        "继续增加测试",
+    ]
+
+
+def test_start_run_rejects_missing_thread(
+    tmp_path: Path,
+) -> None:
+    app, _, _ = _conversation_app(tmp_path)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/threads/not-found/runs",
+            json={
+                "content": "测试",
+            },
+        )
+
+    assert response.status_code == 404

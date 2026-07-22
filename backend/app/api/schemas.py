@@ -148,3 +148,26 @@ class RunResponse(BaseModel):
     error: str | None
     created_at: datetime
     updated_at: datetime
+
+class RunCreateRequest(BaseModel):
+    content: str = Field(
+        min_length=1,
+        max_length=20_000,
+    )
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(
+        cls,
+        value: str,
+    ) -> str:
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("content 不能为空")
+
+        return normalized
+
+class RunStartResponse(BaseModel):
+    run: RunResponse
+    message: MessageResponse

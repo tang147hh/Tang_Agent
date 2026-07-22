@@ -27,7 +27,9 @@ from app.api.schemas import (
     MessageResponse,
     ProjectCreateRequest,
     ProjectResponse,
+    RunCreateRequest,
     RunResponse,
+    RunStartResponse,
     TaskCreateRequest,
     TaskResponse,
     ThreadCreateRequest,
@@ -387,3 +389,42 @@ def get_run(
         )
 
     return RunResponse.model_validate(run)
+
+@router.post(
+    "/api/threads/{thread_id}/runs",
+    response_model=RunStartResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def start_thread_run(
+    thread_id: str,
+    body: RunCreateRequest,
+    request: Request,
+) -> RunStartResponse:
+    navigation_store: ConversationStore = (
+        request.app.state.navigation_store
+    )
+
+    try:
+        run, message = (
+            navigation_store.start_run_with_message(
+                thread_id=thread_id,
+                content=body.content,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="thread not found",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    return RunStartResponse(
+        run=RunResponse.model_validate(run),
+        message=MessageResponse.model_validate(
+            message
+        ),
+    )
