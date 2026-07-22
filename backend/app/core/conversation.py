@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class ThreadStatus(StrEnum):
@@ -71,6 +71,16 @@ class RunSnapshot:
     created_at: datetime
     updated_at: datetime
 
+@dataclass(frozen=True, slots=True)
+class RunEventSnapshot:
+    """一次 Run 执行过程中产生的追加式事件。"""
+
+    event_id: int
+    run_id: str
+    kind: str
+    source: str
+    payload: dict[str, Any]
+    created_at: datetime
 
 class ProjectThreadStore(Protocol):
     """项目和会话持久化协议。"""
@@ -177,3 +187,24 @@ class ConversationStore(
         self,
         thread_id: str,
     ) -> list[MessageSnapshot]: ...
+
+    def append_run_event(
+        self,
+        *,
+        run_id: str,
+        kind: str,
+        source: str,
+        payload: dict[str, Any],
+    ) -> RunEventSnapshot:
+        """向 Run 追加一条事件。"""
+        ...
+
+    def list_run_events(
+        self,
+        run_id: str,
+        *,
+        after_id: int = 0,
+        limit: int = 200,
+    ) -> list[RunEventSnapshot]:
+        """读取指定游标之后的 Run 事件。"""
+        ...

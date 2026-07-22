@@ -1,11 +1,11 @@
 from __future__ import annotations
-
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 from app.core.conversation import (
     MessageRole,
     MessageSnapshot,
@@ -14,6 +14,7 @@ from app.core.conversation import (
     RunStatus,
     ThreadSnapshot,
     ThreadStatus,
+    RunEventSnapshot,
 )
 
 
@@ -113,6 +114,20 @@ class SQLiteProjectThreadStore:
                 """)
 
             connection.execute("""
+                CREATE TABLE IF NOT EXISTS run_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id)
+                        REFERENCES runs(run_id)
+                        ON DELETE CASCADE
+                )
+                """)
+
+            connection.execute("""
                 CREATE INDEX IF NOT EXISTS
                     idx_threads_project_updated
                 ON threads(project_id, updated_at DESC)
@@ -129,6 +144,12 @@ class SQLiteProjectThreadStore:
                 CREATE INDEX IF NOT EXISTS
                     idx_messages_thread_sequence
                 ON messages(thread_id, sequence)
+                """)
+
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS
+                    idx_run_events_run_id_event_id
+                ON run_events(run_id, event_id)
                 """)
 
     def create_project(
@@ -861,6 +882,109 @@ class SQLiteProjectThreadStore:
 
         return [self._message_snapshot(row) for row in rows]
 
+    def append_run_event(
+        self,
+        *,
+        run_id: str,
+        kind: str,
+        source: str,
+        payload: dict[str, Any],
+    ) -> RunEventSnapshot:
+        normalized_kind = kind.strip()
+        normalized_source = source.strip()
+
+        if not normalized_kind:
+            raise ValueError("事件类型不能为空")
+
+        if not normalized_source:
+            raise ValueError("事件来源不能为空")
+
+        created_at = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        with self._connection() as connection:
+            run_row = connection.execute(
+                """
+                SELECT run_id
+                FROM runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+
+            if run_row is None:
+                raise KeyError(f"Run 不存在：{run_id}")
+
+            cursor = connection.execute(
+                """
+                INSERT INTO run_events (
+                    run_id,
+                    kind,
+                    source,
+                    payload_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    normalized_kind,
+                    normalized_source,
+                    payload_json,
+                    created_at,
+                ),
+            )
+
+            row = connection.execute(
+                """
+                SELECT *
+                FROM run_events
+                WHERE event_id = ?
+                """,
+                (cursor.lastrowid,),
+            ).fetchone()
+
+        return self._run_event_snapshot(row)
+
+    def list_run_events(
+        self,
+        run_id: str,
+        *,
+        after_id: int = 0,
+        limit: int = 200,
+    ) -> list[RunEventSnapshot]:
+        normalized_after_id = max(after_id, 0)
+        normalized_limit = min(max(limit, 1), 1000)
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM run_events
+                WHERE run_id = ?
+                AND event_id > ?
+                ORDER BY event_id ASC
+                LIMIT ?
+                """,
+                (
+                    run_id,
+                    normalized_after_id,
+                    normalized_limit,
+                ),
+            ).fetchall()
+
+        return [
+            self._run_event_snapshot(row)
+            for row in rows
+        ]
+
     @staticmethod
     def _project_snapshot(
         row: sqlite3.Row | None,
@@ -923,4 +1047,27 @@ class SQLiteProjectThreadStore:
             role=MessageRole(row["role"]),
             content=str(row["content"]),
             created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    @staticmethod
+    def _run_event_snapshot(
+        row: sqlite3.Row | None,
+    ) -> RunEventSnapshot:
+        if row is None:
+            raise RuntimeError("Run 事件读取失败")
+
+        payload = json.loads(row["payload_json"])
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("Run 事件 payload 必须是对象")
+
+        return RunEventSnapshot(
+            event_id=int(row["event_id"]),
+            run_id=str(row["run_id"]),
+            kind=str(row["kind"]),
+            source=str(row["source"]),
+            payload=payload,
+            created_at=datetime.fromisoformat(
+                row["created_at"]
+            ),
         )
