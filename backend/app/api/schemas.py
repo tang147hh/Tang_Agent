@@ -9,7 +9,11 @@ from pydantic import (
     field_validator,
 )
 
-from app.core.conversation import ThreadStatus
+from app.core.conversation import (
+    MessageRole,
+    RunStatus,
+    ThreadStatus,
+)
 from app.core.task_intent import TaskKind
 from app.core.task_runtime import TaskStatus
 
@@ -44,6 +48,7 @@ class TaskResponse(BaseModel):
     error: str | None
     created_at: datetime
     updated_at: datetime
+
 
 class ProjectCreateRequest(BaseModel):
     name: str = Field(
@@ -114,5 +119,32 @@ class ThreadResponse(BaseModel):
     project_id: str
     title: str
     status: ThreadStatus
+    created_at: datetime
+    updated_at: datetime
+
+
+class MessageResponse(BaseModel):
+    model_config = ConfigDict(
+        from_attributes=True,
+    )
+
+    sequence: int
+    message_id: str
+    thread_id: str
+    run_id: str | None
+    role: MessageRole
+    content: str
+    created_at: datetime
+
+
+class RunResponse(BaseModel):
+    model_config = ConfigDict(
+        from_attributes=True,
+    )
+
+    run_id: str
+    thread_id: str
+    status: RunStatus
+    error: str | None
     created_at: datetime
     updated_at: datetime

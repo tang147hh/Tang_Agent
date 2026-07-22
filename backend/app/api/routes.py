@@ -24,21 +24,22 @@ from app.backends.workspace import (
 )
 
 from app.api.schemas import (
+    MessageResponse,
     ProjectCreateRequest,
     ProjectResponse,
+    RunResponse,
     TaskCreateRequest,
     TaskResponse,
     ThreadCreateRequest,
     ThreadResponse,
 )
-from app.core.conversation import ProjectThreadStore
+from app.core.conversation import ConversationStore
 from app.core.task_intent import classify_task_kind
 from app.core.task_runtime import (
     AgentFactory,
     TaskStore,
     run_agent_task,
 )
-
 
 router = APIRouter()
 
@@ -58,12 +59,8 @@ def create_task(
     background_tasks: BackgroundTasks,
     request: Request,
 ) -> TaskResponse:
-    task_store: TaskStore = (
-        request.app.state.task_store
-    )
-    agent_factory: AgentFactory = (
-        request.app.state.agent_factory
-    )
+    task_store: TaskStore = request.app.state.task_store
+    agent_factory: AgentFactory = request.app.state.agent_factory
 
     task_kind = classify_task_kind(body.prompt)
 
@@ -100,9 +97,7 @@ def get_task(
     thread_id: str,
     request: Request,
 ) -> TaskResponse:
-    task_store: TaskStore = (
-        request.app.state.task_store
-    )
+    task_store: TaskStore = request.app.state.task_store
 
     snapshot = task_store.get(thread_id)
 
@@ -114,15 +109,14 @@ def get_task(
 
     return TaskResponse.model_validate(snapshot)
 
+
 def require_existing_task_store(
     thread_id: str,
     request: Request,
 ) -> TaskStore:
     """取得任务存储，并在流式响应开始前验证任务。"""
 
-    task_store: TaskStore = (
-        request.app.state.task_store
-    )
+    task_store: TaskStore = request.app.state.task_store
 
     if task_store.get(thread_id) is None:
         raise HTTPException(
@@ -173,9 +167,7 @@ async def stream_task_events(
                 data={
                     "thread_id": event.thread_id,
                     "source": event.source,
-                    "created_at": (
-                        event.created_at.isoformat()
-                    ),
+                    "created_at": (event.created_at.isoformat()),
                     **event.payload,
                 },
             )
@@ -185,6 +177,7 @@ async def stream_task_events(
 
         await asyncio.sleep(0.2)
 
+
 def _validated_project_path(
     workspace: Workspace,
     virtual_path: str,
@@ -192,32 +185,20 @@ def _validated_project_path(
     """验证项目路径是 /projects 下的直接子目录。"""
 
     try:
-        real_path = workspace.resolve(
-            virtual_path
-        )
-        canonical_path = workspace.to_virtual(
-            real_path
-        )
+        real_path = workspace.resolve(virtual_path)
+        canonical_path = workspace.to_virtual(real_path)
     except WorkspacePathError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
 
-    parts = PurePosixPath(
-        canonical_path
-    ).parts
+    parts = PurePosixPath(canonical_path).parts
 
-    if (
-        len(parts) != 3
-        or parts[0] != "/"
-        or parts[1] != "projects"
-    ):
+    if len(parts) != 3 or parts[0] != "/" or parts[1] != "projects":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                "项目必须是 /projects 下的直接子目录"
-            ),
+            detail=("项目必须是 /projects 下的直接子目录"),
         )
 
     if not real_path.is_dir():
@@ -228,6 +209,7 @@ def _validated_project_path(
 
     return canonical_path
 
+
 @router.post(
     "/api/projects",
     response_model=ProjectResponse,
@@ -237,12 +219,8 @@ def create_project(
     body: ProjectCreateRequest,
     request: Request,
 ) -> ProjectResponse:
-    navigation_store: ProjectThreadStore = (
-        request.app.state.navigation_store
-    )
-    workspace: Workspace = (
-        request.app.state.workspace
-    )
+    navigation_store: ConversationStore = request.app.state.navigation_store
+    workspace: Workspace = request.app.state.workspace
 
     virtual_path = _validated_project_path(
         workspace,
@@ -262,6 +240,7 @@ def create_project(
 
     return ProjectResponse.model_validate(project)
 
+
 @router.get(
     "/api/projects",
     response_model=list[ProjectResponse],
@@ -269,14 +248,13 @@ def create_project(
 def list_projects(
     request: Request,
 ) -> list[ProjectResponse]:
-    navigation_store: ProjectThreadStore = (
-        request.app.state.navigation_store
-    )
+    navigation_store: ConversationStore = request.app.state.navigation_store
 
     return [
         ProjectResponse.model_validate(project)
         for project in navigation_store.list_projects()
     ]
+
 
 @router.post(
     "/api/projects/{project_id}/threads",
@@ -288,9 +266,7 @@ def create_thread(
     body: ThreadCreateRequest,
     request: Request,
 ) -> ThreadResponse:
-    navigation_store: ProjectThreadStore = (
-        request.app.state.navigation_store
-    )
+    navigation_store: ConversationStore = request.app.state.navigation_store
 
     if navigation_store.get_project(project_id) is None:
         raise HTTPException(
@@ -305,6 +281,7 @@ def create_thread(
 
     return ThreadResponse.model_validate(thread)
 
+
 @router.get(
     "/api/projects/{project_id}/threads",
     response_model=list[ThreadResponse],
@@ -313,9 +290,7 @@ def list_threads(
     project_id: str,
     request: Request,
 ) -> list[ThreadResponse]:
-    navigation_store: ProjectThreadStore = (
-        request.app.state.navigation_store
-    )
+    navigation_store: ConversationStore = request.app.state.navigation_store
 
     if navigation_store.get_project(project_id) is None:
         raise HTTPException(
@@ -325,10 +300,9 @@ def list_threads(
 
     return [
         ThreadResponse.model_validate(thread)
-        for thread in navigation_store.list_threads(
-            project_id
-        )
+        for thread in navigation_store.list_threads(project_id)
     ]
+
 
 @router.get(
     "/api/threads/{thread_id}",
@@ -338,13 +312,9 @@ def get_thread(
     thread_id: str,
     request: Request,
 ) -> ThreadResponse:
-    navigation_store: ProjectThreadStore = (
-        request.app.state.navigation_store
-    )
+    navigation_store: ConversationStore = request.app.state.navigation_store
 
-    thread = navigation_store.get_thread(
-        thread_id
-    )
+    thread = navigation_store.get_thread(thread_id)
 
     if thread is None:
         raise HTTPException(
@@ -353,3 +323,67 @@ def get_thread(
         )
 
     return ThreadResponse.model_validate(thread)
+
+
+@router.get(
+    "/api/threads/{thread_id}/messages",
+    response_model=list[MessageResponse],
+)
+def list_thread_messages(
+    thread_id: str,
+    request: Request,
+) -> list[MessageResponse]:
+    navigation_store: ConversationStore = request.app.state.navigation_store
+
+    if navigation_store.get_thread(thread_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="thread not found",
+        )
+
+    return [
+        MessageResponse.model_validate(message)
+        for message in navigation_store.list_messages(thread_id)
+    ]
+
+
+@router.get(
+    "/api/threads/{thread_id}/runs",
+    response_model=list[RunResponse],
+)
+def list_thread_runs(
+    thread_id: str,
+    request: Request,
+) -> list[RunResponse]:
+    navigation_store: ConversationStore = request.app.state.navigation_store
+
+    if navigation_store.get_thread(thread_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="thread not found",
+        )
+
+    return [
+        RunResponse.model_validate(run) for run in navigation_store.list_runs(thread_id)
+    ]
+
+
+@router.get(
+    "/api/runs/{run_id}",
+    response_model=RunResponse,
+)
+def get_run(
+    run_id: str,
+    request: Request,
+) -> RunResponse:
+    navigation_store: ConversationStore = request.app.state.navigation_store
+
+    run = navigation_store.get_run(run_id)
+
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="run not found",
+        )
+
+    return RunResponse.model_validate(run)

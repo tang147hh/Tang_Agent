@@ -9,7 +9,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from app.backends.workspace import Workspace
 from app.api.routes import router
 from app.core.agent import build_agent
-from app.core.conversation import ProjectThreadStore
+from app.core.conversation import ConversationStore
 from app.core.config import Settings, load_settings
 from app.core.logging_config import configure_logging
 from app.core.task_runtime import (
@@ -27,7 +27,7 @@ def create_app(
     *,
     agent_factory: AgentFactory | None = None,
     task_store: TaskStore | None = None,
-    navigation_store: ProjectThreadStore | None = None,
+    navigation_store: ConversationStore | None = None,
     workspace: Workspace | None = None,
     settings: Settings | None = None,
 ) -> FastAPI:
