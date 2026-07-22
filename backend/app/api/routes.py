@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import PurePosixPath
 from typing import Annotated
 
 from fastapi import (
@@ -17,10 +18,20 @@ from fastapi.sse import (
     ServerSentEvent,
 )
 
+from app.backends.workspace import (
+    Workspace,
+    WorkspacePathError,
+)
+
 from app.api.schemas import (
+    ProjectCreateRequest,
+    ProjectResponse,
     TaskCreateRequest,
     TaskResponse,
+    ThreadCreateRequest,
+    ThreadResponse,
 )
+from app.core.conversation import ProjectThreadStore
 from app.core.task_intent import classify_task_kind
 from app.core.task_runtime import (
     AgentFactory,
@@ -173,3 +184,172 @@ async def stream_task_events(
             return
 
         await asyncio.sleep(0.2)
+
+def _validated_project_path(
+    workspace: Workspace,
+    virtual_path: str,
+) -> str:
+    """验证项目路径是 /projects 下的直接子目录。"""
+
+    try:
+        real_path = workspace.resolve(
+            virtual_path
+        )
+        canonical_path = workspace.to_virtual(
+            real_path
+        )
+    except WorkspacePathError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+    parts = PurePosixPath(
+        canonical_path
+    ).parts
+
+    if (
+        len(parts) != 3
+        or parts[0] != "/"
+        or parts[1] != "projects"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "项目必须是 /projects 下的直接子目录"
+            ),
+        )
+
+    if not real_path.is_dir():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="项目目录不存在",
+        )
+
+    return canonical_path
+
+@router.post(
+    "/api/projects",
+    response_model=ProjectResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_project(
+    body: ProjectCreateRequest,
+    request: Request,
+) -> ProjectResponse:
+    navigation_store: ProjectThreadStore = (
+        request.app.state.navigation_store
+    )
+    workspace: Workspace = (
+        request.app.state.workspace
+    )
+
+    virtual_path = _validated_project_path(
+        workspace,
+        body.virtual_path,
+    )
+
+    try:
+        project = navigation_store.create_project(
+            name=body.name,
+            virtual_path=virtual_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    return ProjectResponse.model_validate(project)
+
+@router.get(
+    "/api/projects",
+    response_model=list[ProjectResponse],
+)
+def list_projects(
+    request: Request,
+) -> list[ProjectResponse]:
+    navigation_store: ProjectThreadStore = (
+        request.app.state.navigation_store
+    )
+
+    return [
+        ProjectResponse.model_validate(project)
+        for project in navigation_store.list_projects()
+    ]
+
+@router.post(
+    "/api/projects/{project_id}/threads",
+    response_model=ThreadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_thread(
+    project_id: str,
+    body: ThreadCreateRequest,
+    request: Request,
+) -> ThreadResponse:
+    navigation_store: ProjectThreadStore = (
+        request.app.state.navigation_store
+    )
+
+    if navigation_store.get_project(project_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="project not found",
+        )
+
+    thread = navigation_store.create_thread(
+        project_id=project_id,
+        title=body.title,
+    )
+
+    return ThreadResponse.model_validate(thread)
+
+@router.get(
+    "/api/projects/{project_id}/threads",
+    response_model=list[ThreadResponse],
+)
+def list_threads(
+    project_id: str,
+    request: Request,
+) -> list[ThreadResponse]:
+    navigation_store: ProjectThreadStore = (
+        request.app.state.navigation_store
+    )
+
+    if navigation_store.get_project(project_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="project not found",
+        )
+
+    return [
+        ThreadResponse.model_validate(thread)
+        for thread in navigation_store.list_threads(
+            project_id
+        )
+    ]
+
+@router.get(
+    "/api/threads/{thread_id}",
+    response_model=ThreadResponse,
+)
+def get_thread(
+    thread_id: str,
+    request: Request,
+) -> ThreadResponse:
+    navigation_store: ProjectThreadStore = (
+        request.app.state.navigation_store
+    )
+
+    thread = navigation_store.get_thread(
+        thread_id
+    )
+
+    if thread is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="thread not found",
+        )
+
+    return ThreadResponse.model_validate(thread)

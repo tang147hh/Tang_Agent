@@ -6,8 +6,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from app.backends.workspace import Workspace
 from app.api.routes import router
 from app.core.agent import build_agent
+from app.core.conversation import ProjectThreadStore
 from app.core.config import Settings, load_settings
 from app.core.logging_config import configure_logging
 from app.core.task_runtime import (
@@ -15,13 +17,18 @@ from app.core.task_runtime import (
     TaskRegistry,
     TaskStore,
 )
-from app.store import SQLiteTaskStore
+from app.store import (
+    SQLiteProjectThreadStore,
+    SQLiteTaskStore,
+)
 
 
 def create_app(
     *,
     agent_factory: AgentFactory | None = None,
     task_store: TaskStore | None = None,
+    navigation_store: ProjectThreadStore | None = None,
+    workspace: Workspace | None = None,
     settings: Settings | None = None,
 ) -> FastAPI:
     """创建 FastAPI 应用并管理持久化资源生命周期。"""
@@ -34,11 +41,31 @@ def create_app(
     ):
         configure_logging(current_settings)
 
-        active_store = task_store or SQLiteTaskStore(
+        database_path = (
             current_settings.data_dir / "tasks.sqlite"
         )
 
+        active_store = task_store or SQLiteTaskStore(
+            database_path
+        )
+
+        active_navigation_store = (
+            navigation_store
+            or SQLiteProjectThreadStore(database_path)
+        )
+
+        active_workspace = (
+            workspace
+            or Workspace.from_settings(current_settings)
+        )
+        active_workspace.ensure_layout()
+
         application.state.task_store = active_store
+        application.state.navigation_store = (
+            active_navigation_store
+        )
+
+        application.state.workspace = active_workspace
 
         checkpoint_connection = None
 
