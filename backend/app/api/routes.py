@@ -36,7 +36,10 @@ from app.api.schemas import (
     ThreadResponse,
 )
 from app.core.conversation_runtime import run_conversation_agent
-from app.core.conversation import ConversationStore
+from app.core.conversation import (
+    ConversationStore,
+    RunStatus,
+)
 from app.core.task_intent import classify_task_kind
 from app.core.task_runtime import (
     AgentFactory,
@@ -390,6 +393,92 @@ def get_run(
         )
 
     return RunResponse.model_validate(run)
+
+
+def require_existing_run_store(
+    run_id: str,
+    request: Request,
+) -> ConversationStore:
+    """取得 ConversationStore，并在响应开始前验证 Run。"""
+
+    conversation_store: ConversationStore = (
+        request.app.state.navigation_store
+    )
+
+    if conversation_store.get_run(run_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="run not found",
+        )
+
+    return conversation_store
+
+
+@router.get(
+    "/api/runs/{run_id}/events",
+    response_class=EventSourceResponse,
+)
+async def stream_run_events(
+    run_id: str,
+    conversation_store: Annotated[
+        ConversationStore,
+        Depends(require_existing_run_store),
+    ],
+    last_event_id: Annotated[
+        int | None,
+        Header(alias="Last-Event-ID"),
+    ] = None,
+):
+    cursor = max(last_event_id or 0, 0)
+    terminal_seen = False
+
+    while True:
+        events = conversation_store.list_run_events(
+            run_id,
+            after_id=cursor,
+        )
+
+        for event in events:
+            cursor = event.event_id
+
+            if event.kind in {
+                "completed",
+                "failed",
+            }:
+                terminal_seen = True
+
+            yield ServerSentEvent(
+                id=str(event.event_id),
+                event=event.kind,
+                retry=3000,
+                data={
+                    "run_id": event.run_id,
+                    "source": event.source,
+                    "created_at": (
+                        event.created_at.isoformat()
+                    ),
+                    **event.payload,
+                },
+            )
+
+        if terminal_seen:
+            return
+
+        run = conversation_store.get_run(run_id)
+
+        if (
+            run is not None
+            and run.status
+            in {
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+            }
+            and not events
+        ):
+            return
+
+        await asyncio.sleep(0.2)
 
 
 @router.post(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -208,6 +209,106 @@ def test_starts_run_with_user_message(
     prompt = agent.received_input["messages"][0]["content"]
     assert "/projects/demo" in prompt
     assert "继续增加测试" in prompt
+
+
+def test_streams_conversation_run_events(
+    tmp_path: Path,
+) -> None:
+    app, thread, _ = _conversation_app(tmp_path)
+
+    with TestClient(app) as client:
+        created = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={
+                "content": "继续分析项目",
+            },
+        )
+
+        assert created.status_code == 202
+        run_id = created.json()["run"]["run_id"]
+
+        response = client.get(
+            f"/api/runs/{run_id}/events"
+        )
+
+    assert response.status_code == 200
+    assert response.headers[
+        "content-type"
+    ].startswith("text/event-stream")
+
+    body = response.text
+    event_names = [
+        line.removeprefix("event: ")
+        for line in body.splitlines()
+        if line.startswith("event: ")
+    ]
+
+    assert event_names == [
+        "created",
+        "running",
+        "token",
+        "completed",
+    ]
+
+    token_payloads = [
+        json.loads(line.removeprefix("data: "))
+        for block in body.split("\n\n")
+        if "event: token" in block
+        for line in block.splitlines()
+        if line.startswith("data: ")
+    ]
+
+    assert [payload["text"] for payload in token_payloads] == [
+        "任务已经完成",
+    ]
+
+
+def test_resumes_run_events_after_last_event_id(
+    tmp_path: Path,
+) -> None:
+    app, thread, _ = _conversation_app(tmp_path)
+
+    with TestClient(app) as client:
+        created = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={
+                "content": "测试事件续传",
+            },
+        )
+
+        run_id = created.json()["run"]["run_id"]
+        store = app.state.navigation_store
+        events = store.list_run_events(run_id)
+        created_event = events[0]
+
+        response = client.get(
+            f"/api/runs/{run_id}/events",
+            headers={
+                "Last-Event-ID": str(
+                    created_event.event_id
+                ),
+            },
+        )
+
+    body = response.text
+
+    assert "event: created" not in body
+    assert "event: running" in body
+    assert "event: token" in body
+    assert "event: completed" in body
+
+
+def test_missing_run_event_stream_returns_404(
+    tmp_path: Path,
+) -> None:
+    app, _, _ = _conversation_app(tmp_path)
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/runs/not-found/events"
+        )
+
+    assert response.status_code == 404
 
 
 def test_start_run_rejects_missing_thread(

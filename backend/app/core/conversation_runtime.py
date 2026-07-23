@@ -12,6 +12,7 @@ from app.core.task_intent import classify_task_kind
 logger = logging.getLogger(__name__)
 
 AgentFactory = Callable[[Any], Any]
+TOKEN_EVENT_FLUSH_CHARS = 80
 
 
 def _stream_source(namespace: Any) -> str:
@@ -93,8 +94,6 @@ def run_conversation_agent(
         if user_message is None:
             raise RuntimeError(f"Run 没有关联的用户消息：{run_id}")
 
-        conversation_store.mark_run_running(run_id)
-
         task_kind = classify_task_kind(user_message.content)
         agent = agent_factory(task_kind)
 
@@ -105,6 +104,45 @@ def run_conversation_agent(
         )
 
         answer_parts: list[str] = []
+        pending_text = ""
+
+        conversation_store.append_run_event(
+            run_id=run_id,
+            kind="created",
+            source="system",
+            payload={
+                "status": "pending",
+            },
+        )
+
+        conversation_store.mark_run_running(run_id)
+
+        conversation_store.append_run_event(
+            run_id=run_id,
+            kind="running",
+            source="system",
+            payload={
+                "status": "running",
+            },
+        )
+
+        def flush_text() -> None:
+            nonlocal pending_text
+
+            if not pending_text:
+                return
+
+            conversation_store.append_run_event(
+                run_id=run_id,
+                kind="token",
+                source="main",
+                payload={
+                    "text": pending_text,
+                },
+            )
+
+            answer_parts.append(pending_text)
+            pending_text = ""
 
         stream = agent.stream(
             {
@@ -149,8 +187,20 @@ def run_conversation_agent(
                 continue
 
             text = _message_text(message)
-            if text:
-                answer_parts.append(text)
+
+            if not text:
+                continue
+
+            pending_text += text
+
+            if (
+                len(pending_text)
+                >= TOKEN_EVENT_FLUSH_CHARS
+                or "\n" in text
+            ):
+                flush_text()
+
+        flush_text()
 
         answer = "".join(answer_parts).strip()
 
@@ -162,13 +212,34 @@ def run_conversation_agent(
             answer,
         )
 
+        conversation_store.append_run_event(
+            run_id=run_id,
+            kind="completed",
+            source="system",
+            payload={
+                "status": "completed",
+            },
+        )
+
     except Exception:
         logger.exception("会话 Run 执行失败：run_id=%s", run_id)
+
+        safe_error = "任务执行失败，请查看服务日志"
 
         try:
             conversation_store.fail_run(
                 run_id,
-                "任务执行失败，请查看服务日志",
+                safe_error,
+            )
+
+            conversation_store.append_run_event(
+                run_id=run_id,
+                kind="failed",
+                source="system",
+                payload={
+                    "status": "failed",
+                    "error": safe_error,
+                },
             )
         except Exception:
             logger.exception(
