@@ -1,6 +1,6 @@
 # Tang Agent 前后端接口与前端功能规划
 
-更新日期：2026-07-22
+更新日期：2026-07-23
 
 ## 1. 文档目标
 
@@ -294,9 +294,19 @@ const source = new EventSource(
 created
 running
 token
+tool_started
+tool_finished
 completed
 failed
 ```
+
+事件来源：
+
+| `source` | 含义 |
+| --- | --- |
+| `system` | Run 生命周期事件 |
+| `main` | 主 Agent 的文本或工具调用 |
+| `subagent:{call_id}` | 某次子 Agent 委派中的文本或工具调用 |
 
 事件数据示例：
 
@@ -308,6 +318,21 @@ failed
   "text": "正在分析项目结构……"
 }
 ```
+
+工具事件示例：
+
+```json
+{
+  "run_id": "uuid",
+  "source": "subagent:call_subagent",
+  "created_at": "2026-07-23T00:00:00+00:00",
+  "name": "workspace_read",
+  "tool_call_id": "call_read",
+  "subagent": "general-purpose"
+}
+```
+
+`tool_started` 与 `tool_finished` 使用同一个 `tool_call_id`，前端应将它们合并为同一条步骤。子 Agent 的 Token 只用于过程展示，不应累加到最终 Assistant 回复。
 
 失败事件可能包含：
 
@@ -323,7 +348,7 @@ failed
 
 接口支持 SSE `Last-Event-ID` 续传。后端将其转换为 SQLite `after_id`，只返回游标之后的事件。
 
-当前 Conversation Run 尚未产生 `tool_started/tool_finished` 和子 Agent 事件。
+Conversation Run 已持久化工具和子 Agent 事件；SSE 断线重连后仍可通过 `Last-Event-ID` 从 SQLite 游标继续读取。
 
 ## 8. 前端页面结构
 
@@ -475,8 +500,8 @@ GET /api/skills/{skill_name}
 | 多轮消息 | 已支持 |
 | Run 实时 Token | 已支持 |
 | Run 生命周期事件 | 已支持 |
-| 工具调用步骤 | Conversation Run 尚未支持 |
-| 子 Agent 步骤 | 尚未支持 |
+| 工具调用步骤 | 已支持，按 `tool_call_id` 归并 |
+| 子 Agent 步骤 | 已支持，按 `source` 区分来源 |
 | 取消 Run | 未支持 |
 | 专用重试接口 | 未支持 |
 | Skills 列表与详情 | 未支持 |
@@ -494,7 +519,7 @@ GET /api/skills/{skill_name}
 6. 接入 Run SSE 和临时 Assistant 消息。
 7. 实现步骤列表、运行状态和完成项划线。
 8. 增加 Skills 页面入口与空状态。
-9. 补充 Skills、工具事件和 GitHub 所需后端接口。
+9. 补充 Skills 和 GitHub 所需后端接口。
 
 ## 12. 当前结论
 
@@ -506,8 +531,8 @@ GET /api/skills/{skill_name}
 → 加载历史消息
 → 发送用户消息
 → 启动 Agent Run
-→ SSE 展示生命周期和流式回答
+→ SSE 展示生命周期、工具、子 Agent 和流式回答
 → 终态后刷新 Run 与消息快照
 ```
 
-下一阶段可以开始实现前端。Skills 和 GitHub 先建立导航入口及页面骨架，再逐步补齐对应后端能力。
+下一阶段补齐 Skills 列表/详情 API，再进入 GitHub clone、分支、commit、push 和 Pull Request 闭环。

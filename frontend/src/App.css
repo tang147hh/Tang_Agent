@@ -775,6 +775,16 @@ button:disabled {
   box-shadow: 0 0 0 4px var(--blue-soft);
 }
 
+.step-subagent .step-number {
+  border-color: #b8a8e6;
+  color: #654caf;
+  background: #f7f4ff;
+}
+
+.step-subagent.step-running .step-number {
+  box-shadow: 0 0 0 4px rgba(101, 76, 175, 0.1);
+}
+
 .step-completed .step-number {
   border-color: #a6dac6;
   color: var(--green);

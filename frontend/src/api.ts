@@ -70,6 +70,8 @@ export interface RunEventPayload {
   status?: RunStatus
   text?: string
   name?: string
+  tool_call_id?: string
+  subagent?: string
   error?: string
 }
 

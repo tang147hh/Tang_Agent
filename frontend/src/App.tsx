@@ -51,6 +51,8 @@ interface AgentStep {
   detail: string
   status: 'running' | 'completed' | 'failed'
   createdAt: string
+  source: string
+  toolCallId?: string
 }
 
 const quickPrompts = [
@@ -104,6 +106,52 @@ function Logo({ small = false }: { small?: boolean }) {
 
 function timeLabel(value: string): string {
   return new Date(value).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+}
+
+function stepIdentity(kind: RunEventKind, payload: RunEventPayload, eventId: string): string {
+  if ((kind === 'tool_started' || kind === 'tool_finished') && payload.tool_call_id) {
+    return `tool:${payload.tool_call_id}`
+  }
+
+  if (kind === 'token') return `token:${payload.source}`
+  return eventId || `${kind}-${payload.created_at}`
+}
+
+function stepPresentation(kind: RunEventKind, payload: RunEventPayload) {
+  const copy = stepCopy[kind]
+  const isSubagent = payload.source.startsWith('subagent')
+  const subagent = payload.subagent ?? 'general-purpose'
+
+  if (kind === 'token' && isSubagent) {
+    return {
+      title: '子 Agent 分析',
+      detail: `${subagent} 正在整理分析结果`,
+    }
+  }
+
+  if (kind === 'tool_started' || kind === 'tool_finished') {
+    const finished = kind === 'tool_finished'
+
+    if (payload.name === 'task') {
+      return {
+        title: '委派子 Agent',
+        detail: finished
+          ? `${subagent} 已返回分析结果`
+          : `正在调用 ${subagent}`,
+      }
+    }
+
+    const toolName = payload.name ?? '项目工具'
+    return {
+      title: isSubagent ? '子 Agent 调用工具' : copy.title,
+      detail: `${isSubagent ? `${subagent} · ` : ''}${toolName}${finished ? ' 已完成' : ''}`,
+    }
+  }
+
+  return {
+    title: copy.title,
+    detail: kind === 'failed' ? payload.error ?? copy.detail : copy.detail,
+  }
 }
 
 function App() {
@@ -180,30 +228,44 @@ function App() {
 
   const updateSteps = useCallback((kind: RunEventKind, payload: RunEventPayload, eventId: string) => {
     setSteps((current) => {
-      const completedPrevious = current.map((step) => step.status === 'running' ? { ...step, status: 'completed' as const } : step)
-      const copy = stepCopy[kind]
-      const detail = kind === 'failed'
-        ? payload.error ?? copy.detail
-        : kind === 'tool_started' || kind === 'tool_finished'
-          ? payload.name ?? copy.detail
-          : copy.detail
+      const id = stepIdentity(kind, payload, eventId)
+      const presentation = stepPresentation(kind, payload)
+      const status = kind === 'failed'
+        ? 'failed' as const
+        : kind === 'created' || kind === 'completed' || kind === 'tool_finished'
+          ? 'completed' as const
+          : 'running' as const
+      const previousStatus = kind === 'failed' ? 'failed' as const : 'completed' as const
+      const completedPrevious = current.map((step) => {
+        if (step.status !== 'running' || step.id === id) return step
+        if (step.toolCallId && payload.source === `subagent:${step.toolCallId}`) return step
+        return { ...step, status: previousStatus }
+      })
+      const existingIndex = completedPrevious.findIndex((step) => step.id === id)
 
-      if (kind === 'token') {
-        const existingIndex = completedPrevious.findIndex((step) => step.kind === 'token')
-        if (existingIndex >= 0) {
-          return completedPrevious.map((step, index) => index === existingIndex ? { ...step, status: 'running', createdAt: payload.created_at } : step)
-        }
+      if (existingIndex >= 0) {
+        return completedPrevious.map((step, index) => index === existingIndex
+          ? {
+              ...step,
+              title: presentation.title,
+              detail: presentation.detail,
+              status,
+              createdAt: payload.created_at,
+            }
+          : step)
       }
 
       return [
         ...completedPrevious,
         {
-          id: eventId || `${kind}-${payload.created_at}`,
+          id,
           kind,
-          title: copy.title,
-          detail,
-          status: kind === 'failed' ? 'failed' : kind === 'completed' || kind === 'created' ? 'completed' : 'running',
+          title: presentation.title,
+          detail: presentation.detail,
+          status,
           createdAt: payload.created_at,
+          source: payload.source,
+          toolCallId: payload.tool_call_id,
         },
       ]
     })
@@ -487,7 +549,7 @@ function App() {
 
             <aside className={`run-panel ${showRunPanel ? 'open' : ''}`}>
               <div className="run-panel-header"><strong>Agent 执行状态</strong><span className={`run-state ${isRunning ? 'running' : lastRun?.status === 'failed' ? 'failed' : ''}`}><i />{isRunning ? '运行中' : lastRun?.status === 'failed' ? '失败' : lastRun?.status === 'completed' ? '已完成' : '空闲'}</span></div>
-              <div className="run-panel-section"><h2>执行步骤</h2>{steps.length ? <ol className="step-list">{steps.map((step, index) => <li key={step.id} className={`step-${step.status}`}><span className="step-number">{step.status === 'completed' ? <Icon name="check" size={14} /> : index + 1}</span><div><div className="step-title"><strong>{step.title}</strong><time>{timeLabel(step.createdAt)}</time></div><p>{step.detail}</p></div></li>)}</ol> : <div className="steps-empty"><Icon name="clock" /><p>发送任务后，这里会实时显示 Agent 的执行过程。</p></div>}</div>
+              <div className="run-panel-section"><h2>执行步骤</h2>{steps.length ? <ol className="step-list">{steps.map((step, index) => <li key={step.id} className={`step-${step.status} ${step.source.startsWith('subagent') ? 'step-subagent' : ''}`}><span className="step-number">{step.status === 'completed' ? <Icon name="check" size={14} /> : index + 1}</span><div><div className="step-title"><strong>{step.title}</strong><time>{timeLabel(step.createdAt)}</time></div><p>{step.detail}</p></div></li>)}</ol> : <div className="steps-empty"><Icon name="clock" /><p>发送任务后，这里会实时显示 Agent 的执行过程。</p></div>}</div>
               <div className="run-details"><div className="details-heading"><strong>任务详情</strong><Icon name="chevron-down" size={16} /></div><dl><div><dt>任务 ID</dt><dd title={lastRun?.run_id}>{lastRun?.run_id.slice(0, 10) ?? '—'}</dd></div><div><dt>创建时间</dt><dd>{lastRun ? new Date(lastRun.created_at).toLocaleString('zh-CN') : '—'}</dd></div><div><dt>模型</dt><dd>DeepSeek V4</dd></div><div><dt>项目路径</dt><dd title={selectedProject?.virtual_path}>{selectedProject?.virtual_path ?? '—'}</dd></div></dl></div>
             </aside>
           </div>

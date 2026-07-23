@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    ToolMessage,
+    ToolMessageChunk,
+)
 
 from app.core.conversation import ConversationStore
 from app.core.task_intent import classify_task_kind
@@ -15,6 +21,13 @@ AgentFactory = Callable[[Any], Any]
 TOKEN_EVENT_FLUSH_CHARS = 80
 
 
+@dataclass(frozen=True, slots=True)
+class _ToolCall:
+    name: str
+    call_id: str | None
+    subagent: str | None
+
+
 def _stream_source(namespace: Any) -> str:
     if not namespace:
         return "main"
@@ -23,6 +36,13 @@ def _stream_source(namespace: Any) -> str:
         parts = (namespace,)
     else:
         parts = tuple(str(part) for part in namespace)
+
+    for part in parts:
+        if not part.startswith("tools:"):
+            continue
+
+        _, _, call_id = part.partition(":")
+        return f"subagent:{call_id}" if call_id else "subagent"
 
     return "subagent" if any(parts) else "main"
 
@@ -53,9 +73,68 @@ def _message_text(message: Any) -> str:
     return "".join(parts)
 
 
-def _has_tool_calls(message: Any) -> bool:
-    tool_calls = getattr(message, "tool_calls", None)
-    return bool(tool_calls)
+def _tool_calls(message: Any) -> list[_ToolCall]:
+    """提取工具名称、调用 ID 和子 Agent 类型。"""
+
+    raw_calls = getattr(message, "tool_call_chunks", None) or []
+
+    if not raw_calls:
+        raw_calls = getattr(message, "tool_calls", None) or []
+
+    calls: list[_ToolCall] = []
+    seen: set[tuple[str, str]] = set()
+
+    for raw_call in raw_calls:
+        if isinstance(raw_call, dict):
+            name = raw_call.get("name")
+            call_id = raw_call.get("id")
+            arguments = raw_call.get("args")
+        else:
+            name = getattr(raw_call, "name", None)
+            call_id = getattr(raw_call, "id", None)
+            arguments = getattr(raw_call, "args", None)
+
+        if not isinstance(name, str) or not name:
+            continue
+
+        normalized_call_id = (
+            call_id if isinstance(call_id, str) and call_id else None
+        )
+        key = (normalized_call_id or "", name)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        subagent = None
+
+        if name == "task" and isinstance(arguments, dict):
+            raw_subagent = arguments.get("subagent_type")
+
+            if isinstance(raw_subagent, str) and raw_subagent:
+                subagent = raw_subagent
+
+        calls.append(
+            _ToolCall(
+                name=name,
+                call_id=normalized_call_id,
+                subagent=subagent,
+            )
+        )
+
+    return calls
+
+
+def _subagent_name(
+    source: str,
+    subagents: dict[str, str],
+) -> str | None:
+    if not source.startswith("subagent:"):
+        return None
+
+    _, _, call_id = source.partition(":")
+    return subagents.get(call_id)
 
 
 def run_conversation_agent(
@@ -105,6 +184,10 @@ def run_conversation_agent(
 
         answer_parts: list[str] = []
         pending_text = ""
+        pending_source = "main"
+        started_call_ids: set[str] = set()
+        finished_call_ids: set[str] = set()
+        subagents: dict[str, str] = {}
 
         conversation_store.append_run_event(
             run_id=run_id,
@@ -128,20 +211,33 @@ def run_conversation_agent(
 
         def flush_text() -> None:
             nonlocal pending_text
+            nonlocal pending_source
 
             if not pending_text:
                 return
 
+            payload = {
+                "text": pending_text,
+            }
+            subagent = _subagent_name(
+                pending_source,
+                subagents,
+            )
+
+            if subagent is not None:
+                payload["subagent"] = subagent
+
             conversation_store.append_run_event(
                 run_id=run_id,
                 kind="token",
-                source="main",
-                payload={
-                    "text": pending_text,
-                },
+                source=pending_source,
+                payload=payload,
             )
 
-            answer_parts.append(pending_text)
+            # 子 Agent 文本用于过程展示，不进入最终 Assistant 消息。
+            if pending_source == "main":
+                answer_parts.append(pending_text)
+
             pending_text = ""
 
         stream = agent.stream(
@@ -175,22 +271,113 @@ def run_conversation_agent(
                 continue
 
             message = data[0]
-            namespace = part.get("ns")
+            source = _stream_source(part.get("ns"))
+            tool_calls = _tool_calls(message)
 
-            if _stream_source(namespace) != "main":
-                continue
+            if tool_calls:
+                flush_text()
 
-            if not isinstance(message, (AIMessage, AIMessageChunk)):
-                continue
+                for tool_call in tool_calls:
+                    if (
+                        tool_call.call_id is not None
+                        and tool_call.call_id in started_call_ids
+                    ):
+                        continue
 
-            if _has_tool_calls(message):
+                    if tool_call.call_id is not None:
+                        started_call_ids.add(tool_call.call_id)
+
+                    if (
+                        tool_call.name == "task"
+                        and tool_call.call_id is not None
+                        and tool_call.subagent is not None
+                    ):
+                        subagents[tool_call.call_id] = tool_call.subagent
+
+                    payload: dict[str, Any] = {
+                        "name": tool_call.name,
+                    }
+
+                    if tool_call.call_id is not None:
+                        payload["tool_call_id"] = tool_call.call_id
+
+                    subagent = tool_call.subagent or _subagent_name(
+                        source,
+                        subagents,
+                    )
+
+                    if subagent is not None:
+                        payload["subagent"] = subagent
+
+                    conversation_store.append_run_event(
+                        run_id=run_id,
+                        kind="tool_started",
+                        source=source,
+                        payload=payload,
+                    )
+
+            if isinstance(
+                message,
+                (ToolMessage, ToolMessageChunk),
+            ):
+                flush_text()
+
+                raw_call_id = getattr(
+                    message,
+                    "tool_call_id",
+                    None,
+                )
+                call_id = (
+                    raw_call_id
+                    if isinstance(raw_call_id, str) and raw_call_id
+                    else None
+                )
+
+                if call_id is not None and call_id in finished_call_ids:
+                    continue
+
+                if call_id is not None:
+                    finished_call_ids.add(call_id)
+
+                tool_name = getattr(message, "name", None) or "unknown"
+                payload = {
+                    "name": tool_name,
+                }
+
+                if call_id is not None:
+                    payload["tool_call_id"] = call_id
+
+                subagent = (
+                    subagents.get(call_id)
+                    if call_id is not None
+                    else None
+                ) or _subagent_name(source, subagents)
+
+                if subagent is not None:
+                    payload["subagent"] = subagent
+
+                conversation_store.append_run_event(
+                    run_id=run_id,
+                    kind="tool_finished",
+                    source=source,
+                    payload=payload,
+                )
+
                 continue
 
             text = _message_text(message)
 
-            if not text:
+            if (
+                not isinstance(message, (AIMessage, AIMessageChunk))
+                or not text
+                or tool_calls
+            ):
                 continue
 
+            if pending_text and source != pending_source:
+                flush_text()
+
+            pending_source = source
             pending_text += text
 
             if (

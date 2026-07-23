@@ -10,7 +10,11 @@ from app.backends.workspace import Workspace
 from app.core.conversation import MessageRole
 from app.core.task_runtime import TaskRegistry
 from app.store import SQLiteProjectThreadStore
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    ToolMessage,
+)
 
 
 class SuccessfulConversationAgent:
@@ -52,6 +56,91 @@ class SuccessfulConversationAgent:
 class FailingConversationAgent:
     def stream(self, *args, **kwargs):
         raise RuntimeError("provider secret details")
+
+
+class ObservableConversationAgent:
+    def stream(self, *args, **kwargs):
+        yield {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "task",
+                            "args": {
+                                "subagent_type": "general-purpose",
+                                "description": "分析项目结构",
+                            },
+                            "id": "call_subagent",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                {},
+            ),
+        }
+        yield {
+            "type": "messages",
+            "ns": ("tools:call_subagent",),
+            "data": (
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "workspace_read",
+                            "args": {
+                                "path": "/projects/demo/README.md",
+                            },
+                            "id": "call_read",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                {},
+            ),
+        }
+        yield {
+            "type": "messages",
+            "ns": ("tools:call_subagent",),
+            "data": (
+                ToolMessage(
+                    content="文件读取成功",
+                    tool_call_id="call_read",
+                    name="workspace_read",
+                ),
+                {},
+            ),
+        }
+        yield {
+            "type": "messages",
+            "ns": ("tools:call_subagent",),
+            "data": (
+                AIMessageChunk(content="子 Agent 分析完成"),
+                {},
+            ),
+        }
+        yield {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                ToolMessage(
+                    content="分析结果已返回",
+                    tool_call_id="call_subagent",
+                    name="task",
+                ),
+                {},
+            ),
+        }
+        yield {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                AIMessageChunk(content="主 Agent 完成回答"),
+                {},
+            ),
+        }
 
 
 def _conversation_app(
@@ -260,6 +349,100 @@ def test_streams_conversation_run_events(
 
     assert [payload["text"] for payload in token_payloads] == [
         "任务已经完成",
+    ]
+
+
+def test_streams_tool_and_subagent_run_events(
+    tmp_path: Path,
+) -> None:
+    app, thread, _ = _conversation_app(
+        tmp_path,
+        agent_factory=lambda task_kind: (
+            ObservableConversationAgent()
+        ),
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={
+                "content": "委派子 Agent 分析项目",
+            },
+        )
+        run_id = created.json()["run"]["run_id"]
+        response = client.get(f"/api/runs/{run_id}/events")
+        messages = client.get(
+            f"/api/threads/{thread.thread_id}/messages"
+        ).json()
+
+    assert response.status_code == 200
+
+    events = []
+
+    for block in response.text.split("\n\n"):
+        event_name = next(
+            (
+                line.removeprefix("event: ")
+                for line in block.splitlines()
+                if line.startswith("event: ")
+            ),
+            None,
+        )
+        payload = next(
+            (
+                json.loads(line.removeprefix("data: "))
+                for line in block.splitlines()
+                if line.startswith("data: ")
+            ),
+            None,
+        )
+
+        if event_name is not None and payload is not None:
+            events.append((event_name, payload))
+
+    assert [name for name, _ in events] == [
+        "created",
+        "running",
+        "tool_started",
+        "tool_started",
+        "tool_finished",
+        "token",
+        "tool_finished",
+        "token",
+        "completed",
+    ]
+
+    task_started = events[2][1]
+    assert task_started["name"] == "task"
+    assert task_started["tool_call_id"] == "call_subagent"
+    assert task_started["subagent"] == "general-purpose"
+    assert task_started["source"] == "main"
+
+    child_tool_started = events[3][1]
+    assert child_tool_started["name"] == "workspace_read"
+    assert child_tool_started["tool_call_id"] == "call_read"
+    assert child_tool_started["subagent"] == "general-purpose"
+    assert child_tool_started["source"] == (
+        "subagent:call_subagent"
+    )
+
+    subagent_token = events[5][1]
+    assert subagent_token["text"] == "子 Agent 分析完成"
+    assert subagent_token["source"] == "subagent:call_subagent"
+    assert subagent_token["subagent"] == "general-purpose"
+
+    main_token = events[7][1]
+    assert main_token["text"] == "主 Agent 完成回答"
+    assert main_token["source"] == "main"
+
+    run_messages = [
+        message
+        for message in messages
+        if message["run_id"] == run_id
+    ]
+    assert [message["content"] for message in run_messages] == [
+        "委派子 Agent 分析项目",
+        "主 Agent 完成回答",
     ]
 
 
