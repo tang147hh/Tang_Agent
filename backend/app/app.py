@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from typing import Any
 
 from fastapi import FastAPI
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -15,6 +16,7 @@ from app.core.conversation import ConversationStore
 from app.core.config import Settings, load_settings
 from app.core.logging_config import configure_logging
 from app.core.model import make_main_model
+from app.core.github_review import GitHubCliRunner, GitHubCommandRunner
 from app.core.task_runtime import (
     AgentFactory,
     TaskRegistry,
@@ -23,6 +25,11 @@ from app.core.task_runtime import (
 from app.store import (
     SQLiteProjectThreadStore,
     SQLiteTaskStore,
+)
+from app.tools.web_search import (
+    SearchCache,
+    SearchProvider,
+    make_search_provider,
 )
 
 
@@ -33,6 +40,9 @@ def create_app(
     navigation_store: ConversationStore | None = None,
     workspace: Workspace | None = None,
     settings: Settings | None = None,
+    reviewer: Any | None = None,
+    github_runner: GitHubCommandRunner | None = None,
+    search_provider: SearchProvider | None = None,
 ) -> FastAPI:
     """创建 FastAPI 应用并管理持久化资源生命周期。"""
 
@@ -69,6 +79,23 @@ def create_app(
         )
 
         application.state.workspace = active_workspace
+        application.state.settings = current_settings
+        application.state.reviewer = reviewer
+        application.state.github_runner = github_runner or GitHubCliRunner()
+        application.state.search_provider = (
+            search_provider
+            or make_search_provider(
+                current_settings.web_search_provider,
+                zhipu_api_key=current_settings.zhipu_api_key,
+            )
+        )
+        application.state.search_cache = SearchCache(
+            ttl_seconds=current_settings.web_search_cache_ttl_seconds,
+            empty_ttl_seconds=(
+                current_settings.web_search_empty_cache_ttl_seconds
+            ),
+            max_entries=current_settings.web_search_cache_max_entries,
+        )
 
         checkpoint_connection = None
 
@@ -100,6 +127,8 @@ def create_app(
 
             def persistent_agent_factory(
                 task_kind,
+                *,
+                search_runtime=None,
             ):
                 return build_agent(
                     task_kind,
@@ -107,11 +136,16 @@ def create_app(
                     model=shared_model(),
                     subagent_model=shared_model(),
                     checkpointer=checkpointer,
+                    search_runtime=search_runtime,
                 )
 
             application.state.agent_factory = (
                 persistent_agent_factory
             )
+            if application.state.reviewer is None:
+                application.state.reviewer = (
+                    lambda messages: shared_model().invoke(messages)
+                )
             application.state.checkpointer = checkpointer
 
         try:

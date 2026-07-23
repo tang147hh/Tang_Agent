@@ -59,6 +59,10 @@ def test_migrates_existing_runs_to_read_only_mode(
 
     assert migrated is not None
     assert migrated.task_kind is TaskKind.QA
+    assert migrated.network_access is False
+    assert migrated.network_provider == "disabled"
+    assert migrated.network_request_count == 0
+    assert migrated.network_limit_reached is False
 
 
 def test_persists_messages_and_runs(
@@ -340,3 +344,35 @@ def test_run_performance_survives_store_reopen(
     assert performance.first_output_ms == 125.0
     assert performance.duration_ms == 750.0
     assert performance.termination_reason == "tool_call_limit"
+
+
+def test_run_network_authorization_is_immutable_while_metrics_update(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteProjectThreadStore(tmp_path / "tasks.sqlite")
+    thread = _create_thread(store)
+    run = store.create_run(
+        thread_id=thread.thread_id,
+        task_kind=TaskKind.QA,
+        network_access=True,
+        network_provider="fake",
+    )
+    store.mark_run_running(run.run_id)
+    store.complete_run(run.run_id)
+    updated = store.update_run_network_metrics(
+        run_id=run.run_id,
+        request_count=2,
+        result_count=4,
+        bytes_received=512,
+        cache_hit_count=1,
+        limit_reached=True,
+        limit_reason="network_search_limit",
+    )
+
+    assert updated.network_access is True
+    assert updated.network_provider == "fake"
+    assert updated.network_request_count == 2
+    assert updated.network_result_count == 4
+    assert updated.network_bytes_received == 512
+    assert updated.network_cache_hit_count == 1
+    assert updated.network_limit_reason == "network_search_limit"

@@ -100,6 +100,43 @@ Content-Type: application/json
 - 非法路径或不存在的目录返回 `422 Unprocessable Content`。
 - 该接口只登记项目，不负责创建目录或克隆 GitHub 仓库。
 
+### 3.3 获取项目文件改动统计
+
+```http
+GET /api/projects/{project_id}/file-changes
+```
+
+返回当前 Git 工作区相对 `HEAD` 的累计改动，包括已暂存、未暂存和未跟踪文件：
+
+```json
+{
+  "project_path": "/projects/demo",
+  "changed_files": 3,
+  "additions": 27,
+  "deletions": 8,
+  "binary_files": 0,
+  "hidden_files": 1,
+  "files": [
+    {
+      "path": "/projects/demo/backend/app.py",
+      "additions": 14,
+      "deletions": 3,
+      "binary": false,
+      "status": "modified"
+    }
+  ]
+}
+```
+
+`status` 为 `modified`、`added`、`deleted` 或 `untracked`。二进制或超过安全读取上限的
+未跟踪文件无法可靠计算行数，此时 `binary=true`，`additions/deletions` 为 `null`。
+敏感路径不返回，只累加 `hidden_files`。响应只含 `/projects/...` 虚拟路径和行数，不含
+diff 内容或真实主机路径。
+
+前端在执行侧栏显示总文件数、总增删行和逐文件统计，并在 Run 终态、项目切换及返回
+聊天视图时刷新。这里展示的是当前工作区累计状态，不声明所有改动都由最近一次 Run
+产生。项目不存在或不是 Git 仓库返回 `404`；改动过多或 Git 无法读取返回 `409`。
+
 ## 4. Thread 接口
 
 ### 4.1 获取项目下的会话
@@ -215,11 +252,14 @@ Content-Type: application/json
 ```json
 {
   "content": "修改登录页面并运行测试",
-  "task_kind": "coding"
+  "task_kind": "coding",
+  "network_access": false
 }
 ```
 
 `task_kind` 可选。新版前端会明确传入用户在输入框下方选择的模式；旧客户端不传时，后端仍根据 `content` 自动分类。
+`network_access` 也可选，缺省为 `false`。它在创建 Run 时与固定 provider 一起保存，
+之后切换聊天框设置不会修改已经创建或完成的 Run。
 
 | `task_kind` | 权限与用途 |
 | --- | --- |
@@ -240,6 +280,14 @@ Content-Type: application/json
     "task_kind": "coding",
     "status": "pending",
     "error": null,
+    "network_access": false,
+    "network_provider": "disabled",
+    "network_request_count": 0,
+    "network_result_count": 0,
+    "network_bytes_received": 0,
+    "network_cache_hit_count": 0,
+    "network_limit_reached": false,
+    "network_limit_reason": null,
     "created_at": "2026-07-22T00:00:00+00:00",
     "updated_at": "2026-07-22T00:00:00+00:00"
   },
@@ -289,6 +337,7 @@ Run 状态：
 | `cancelled` | 本轮已取消；目前没有取消接口 |
 
 Run 的列表和详情响应都会返回 `task_kind`，前端可据此展示历史 Run 实际使用的权限模式。
+同时返回联网授权快照和网络指标；API 不提供修改历史 Run 联网授权的操作。
 
 ### 6.4 Thread 对话历史与 Run 状态隔离
 
@@ -349,6 +398,448 @@ GET /api/runs/{run_id}/performance
 相同工具与规范化参数默认最多出现两次。第二次由中间件返回可恢复拒绝；模型仍持续
 发起相同调用时，后端以 `repeated_tool_call` 终止 Run。
 
+### 6.5.1 工具与联网能力
+
+发送前查询选定模式与下一次 Run 的联网状态：
+
+```http
+GET /api/tool-capabilities?task_kind=analysis&network_access=true
+```
+
+查询已创建 Run 的不可变快照：
+
+```http
+GET /api/runs/{run_id}/tool-capabilities
+```
+
+响应：
+
+```json
+{
+  "task_kind": "analysis",
+  "run_id": null,
+  "network_access": true,
+  "network_provider": "zhipu",
+  "web_search": {
+    "available": true,
+    "provider": "zhipu",
+    "configured": true,
+    "provider_available": true,
+    "allowed_in_mode": true,
+    "enabled_for_run": true,
+    "unavailable_reason": null
+  },
+  "network_budget": {
+    "max_searches": 4,
+    "max_results_per_search": 5,
+    "request_timeout_seconds": 15,
+    "max_result_chars_per_search": 8000,
+    "max_total_result_chars": 24000,
+    "max_bytes_received": 2097152
+  },
+  "tools": []
+}
+```
+
+实际 `tools` 数组返回固定注册工具的完整元数据：`name`、`category`、`risk_level`、
+`allowed_task_kinds`、`requires_network_access`、`model_callable`、`description`、
+`availability` 和 `unavailable_reason`。`github_review_publish` 会出现为
+`external_write` 且 `model_callable=false`，但不会进入任何 Agent 工具列表。
+
+能力响应绝不包含 API Key、Token、SDK 路径、完整环境变量或 provider 原始异常。
+Provider 未配置、缺 SDK/Key 或后端不可用时，前端在紧凑联网菜单中显示受控原因，
+不提供 Key 输入框。
+
+### 6.5.2 工作区文件定位与代码搜索
+
+`workspace_glob` 和 `workspace_search` 是固定注册的 `local_read`、low-risk 能力，无需
+`network_access`。qa/planning/analysis/coding 主 Agent 均可使用，analysis 子 Agent
+也可使用；Reviewer 的 `tools=[]`，GitHub Review prepare/publish 不经过 Agent 工具。
+
+`workspace_glob` 输入：
+
+```json
+{
+  "path": "/projects/demo",
+  "pattern": "**/*.py",
+  "max_results": 100,
+  "include_directories": false
+}
+```
+
+成功输出：
+
+```json
+{
+  "ok": true,
+  "path": "/projects/demo",
+  "pattern": "**/*.py",
+  "matches": [
+    {"path": "/projects/demo/app/main.py", "kind": "file", "size_bytes": 1250}
+  ],
+  "match_count": 1,
+  "truncated": false,
+  "scanned_entry_count": 12,
+  "duration_ms": 4.0
+}
+```
+
+`workspace_search` 输入：
+
+```json
+{
+  "path": "/projects/demo",
+  "query": "build_agent(",
+  "file_pattern": "**/*.py",
+  "max_results": 100,
+  "case_sensitive": true
+}
+```
+
+成功输出的 `matches[]` 包含虚拟 `path`、1-based `line_number`、`column_start`、
+`column_end` 和最多 500 字符的 `snippet`；顶层还返回 `match_count`、`files_searched`、
+`skipped_file_count`、`scanned_bytes`、`truncated` 和 `duration_ms`。
+
+两个工具只接受 `/projects/...` 等虚拟根，模式必须相对于 `path`。`max_results` 为 1-500；
+模式最长 512 字符，query 最长 500 字符。绝对主机/Windows 路径、`..`、NUL、控制字符、
+`.secrets`、符号链接、依赖/缓存/构建目录和敏感文件均被拒绝或跳过。内容搜索是字面量
+匹配，不接受正则；二进制、非 UTF-8 和超过 1,000,000 bytes 的文件不会读取。单次最多
+扫描 50,000 个目录项和 20,000,000 bytes 文本。
+
+这些调用使用现有 `ToolGovernanceMiddleware` 和 Run 事件 tracker，因此会计入
+`tool_calls`，相同工具+规范参数会进入重复检测，超过预算产生 `terminated` 事件。工具
+参数中不存在 task kind、Reviewer、network、write 或 command 权限开关。
+
+### 6.6 Review Finding
+
+Reviewer 的结果属于产生它的具体 Run，而不是只属于 Thread。同一个 Thread 的不同
+审查 Run 可以保留相同问题，用于比较历次审查结果。
+
+```http
+GET /api/runs/{run_id}/review-findings
+GET /api/runs/{run_id}/review-findings?severity=high&status=open
+```
+
+`severity` 和 `status` 均为可选筛选参数。默认排序依次为严重程度
+`critical > high > medium > low`、`file_path`、`start_line`、`created_at` 和 `id`。
+
+完整响应示例：
+
+```json
+[
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "run_id": "c3b1a5d8-8e18-4b06-b6e9-d77b9ba9693f",
+    "severity": "high",
+    "category": "correctness",
+    "file_path": "/projects/demo/backend/app.py",
+    "start_line": 42,
+    "end_line": 47,
+    "line_side": "new",
+    "title": "失败分支继续使用空值",
+    "description": "配置缺失时函数继续执行，并在下一行解引用空值，导致请求返回 500。",
+    "suggestion": "在配置校验失败后立即返回受控错误。",
+    "status": "open",
+    "fingerprint": "9a0d8f56d2b65e5a6e5a5da3ecda8f80f9d08db7580b31bbbeb28f7fa72a1b67",
+    "review_diff_hash": "5721d9fca8a6...",
+    "review_scope": "all",
+    "base_revision": "a61c27f...",
+    "head_revision": null,
+    "created_at": "2026-07-23T00:00:00+00:00",
+    "updated_at": "2026-07-23T00:00:00+00:00"
+  }
+]
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `id` | 后端生成的 Finding UUID |
+| `run_id` | 产生 Finding 的业务 Run |
+| `severity` | 稳定严重级别枚举 |
+| `category` | 稳定问题类别枚举 |
+| `file_path` | 当前项目内的虚拟路径；全局问题为 `null` |
+| `start_line` / `end_line` | 闭区间正整数；全局问题均为 `null` |
+| `line_side` | `old` 或 `new`；文件级/全局 Finding 为 `null` |
+| `title` | 简短问题标题 |
+| `description` | 风险、触发条件和影响 |
+| `suggestion` | 可选修改建议，不表示已经修复 |
+| `status` | 用户维护的 Finding 生命周期状态 |
+| `fingerprint` | 后端生成的稳定 SHA-256 去重指纹 |
+| `review_diff_hash` | 产生 Finding 的规范化、脱敏及截断后 Diff 哈希 |
+| `review_scope` | `staged`、`unstaged` 或 `all`；第 34 课历史数据为 `null` |
+| `base_revision` / `head_revision` | 本次审查的 Git revision 追溯字段；工作树侧没有 SHA 时为 `null` |
+| `created_at` / `updated_at` | 创建与最后状态更新时间 |
+
+枚举值：
+
+```text
+severity: critical | high | medium | low
+category: correctness | security | performance | maintainability | testing | documentation
+status: open | resolved | dismissed
+```
+
+全局问题的 `file_path`、行号和 `line_side` 必须同时为 `null`；文件级问题只保留
+`file_path`；行级问题必须同时提供起止行，`end_line >= start_line`，并使用明确的
+`old/new` 侧。后端只返回 `/projects/...`
+虚拟路径，并拒绝 macOS 主机绝对路径、Windows 盘符、`..` 路径逃逸和不属于当前
+Run 项目的路径。带 `review_diff_hash` 的 Finding 还必须指向本次 Diff 中模型实际看到
+的文件和 hunk；被截断的不可见区域、Diff 外文件和二进制行号都会被拒绝。
+
+只允许更新状态：
+
+```http
+PATCH /api/runs/{run_id}/review-findings/{finding_id}
+Content-Type: application/json
+
+{"status": "resolved"}
+```
+
+PATCH 只修改 `status` 和 `updated_at`。不存在的 Run，或 Finding 不属于 URL 中的
+Run，返回 `404`；非法筛选枚举、非法状态和多余请求字段返回 `422`，且不会修改数据。
+前端没有创建 Finding 的公开 API；Finding 只能来自后端受控的 Reviewer 解析链路。
+
+### 6.7 发起安全 Git Diff 审查
+
+```http
+POST /api/runs/{run_id}/reviews
+Content-Type: application/json
+
+{"scope":"all"}
+```
+
+请求只接受 `scope`，并禁止额外字段。没有 `cwd`、仓库路径、Shell 命令或 base revision
+参数。仓库从 `run_id -> thread -> registered project` 确定，且必须是
+`/projects/...` 下的独立 Git 根目录。
+
+scope 定义：
+
+| scope | 内容 |
+| --- | --- |
+| `staged` | `HEAD`（无 HEAD 时为空树）到 index |
+| `unstaged` | index 到工作树，不含 untracked |
+| `all` | `HEAD`（无 HEAD 时为空树）到最终工作树，并加入未忽略的 untracked |
+
+响应示例（API 不返回 `patch`，只返回由后端解析的安全结构）：
+
+```json
+{
+  "run_id": "uuid",
+  "status": "completed",
+  "scope": "all",
+  "diff": {
+    "scope": "all",
+    "repository_virtual_path": "/projects/demo",
+    "base_revision": "a61c27f...",
+    "head_revision": null,
+    "file_count": 1,
+    "total_additions": 2,
+    "total_deletions": 1,
+    "truncated": false,
+    "truncation_reasons": [],
+    "content_hash": "5721d9fca8a6...",
+    "created_at": "2026-07-23T00:00:00+00:00",
+    "redacted": false,
+    "files": [
+      {
+        "old_path": "/projects/demo/app.py",
+        "new_path": "/projects/demo/app.py",
+        "change_type": "modified",
+        "binary": false,
+        "submodule": false,
+        "additions": 2,
+        "deletions": 1,
+        "truncated": false,
+        "truncation_reason": null,
+        "changed_new_lines": [42, 43],
+        "changed_old_lines": [42],
+        "redacted": false,
+        "hunks": [
+          {
+            "header": "@@ -42,1 +42,2 @@",
+            "old_start": 42,
+            "old_count": 1,
+            "new_start": 42,
+            "new_count": 2,
+            "lines": [
+              {
+                "type": "deletion",
+                "old_line_number": 42,
+                "new_line_number": null,
+                "content": "return old_value"
+              },
+              {
+                "type": "addition",
+                "old_line_number": null,
+                "new_line_number": 42,
+                "content": "return new_value"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "findings": [],
+  "finding_count": 0,
+  "created_count": 0,
+  "duplicate_count": 0,
+  "summary": "审查范围：all。未发现问题。"
+}
+```
+
+`change_type` 为 `modified|added|deleted|renamed|copied|untracked`。删除文件只有
+`old_path`，新增/untracked 只有 `new_path`，rename/copy 同时保留两侧。二进制文件和
+子模块只返回元数据，Reviewer 不会收到二进制字节，也不会递归读取子模块。
+
+容量安全默认值：50 文件、单文件 40,000 patch 字符/800 变更行、总计 200,000
+字符/3,000 变更行、Git 命令 30 秒。达到限制时使用稳定原因
+`max_files|file_patch_chars|file_changed_lines|total_patch_chars|total_changed_lines|git_output`，
+总结必须说明结果可能不完整。环境变量名见 `.env.example`。
+
+进入 Reviewer 的 patch 已将私钥、GitHub/API/Bearer/Access Token、Secret、Password
+和常见 `.env` 凭据替换为 `[REDACTED]`，换行及行号不变。Reviewer 没有文件、命令、
+网络或发布工具；Diff 内提示词注入只会被当成代码。无变更时不调用模型。Diff 收集计入
+共享 `tool_calls`，模型调用计入 `model_calls`，并受原 Run 的总时长和终态规则约束。
+
+受控错误的 `detail` 为 `{code, message}`。常见 code 包括 `run_not_found`、
+`repository_not_found`、`repository_outside_workspace`、`git_command_failed`、
+`git_command_timeout`、`run_time_limit`、`reviewer_unavailable`、`reviewer_output_invalid` 和
+`budget_exceeded`；message 不包含 Git stderr 或主机真实路径。
+
+### 6.8 Review 快照与新审查 Run
+
+第 36 课增加两个接口：
+
+```http
+GET /api/runs/{run_id}/review
+POST /api/threads/{thread_id}/review-runs
+Content-Type: application/json
+
+{"scope":"all"}
+```
+
+`review_diff_snapshots` 以 `run_id` 为主键，只保存已经完成路径规范化、容量限制、UTF-8
+安全截断、敏感内容脱敏和二进制排除的 `ReviewDiff`。同一 Run 不允许覆盖快照；再次
+审查必须通过 `review-runs` 创建新的 `analysis` Run。快照在 Reviewer 模型调用前落库，
+因此预算或模型阶段失败时仍能展示 Reviewer 实际收到或原计划收到的受控 Diff。
+
+GET 详情返回 `status: collected|completed|failed`、summary、结构化 Diff 和当前 Finding。
+每个 hunk 包含范围，每行类型为 `context|addition|deletion|no_newline`，并分别返回
+`old_line_number` 与 `new_line_number`。删除 Finding 按 old 侧定位，新增/普通修改按
+new 侧定位；文件级 Finding 定位文件标题，二进制只允许文件级定位。接口永远不返回
+受控 patch 本身，更不返回原始未脱敏 patch 或主机路径。
+
+前端 Repository 详情中的“代码审查”只对虚拟路径匹配的已登记 Project 开放，不接受
+用户输入 cwd。工作台桌面端使用文件/Diff/问题三栏，平板和移动端使用标签页；只渲染
+当前文件。Finding 状态 PATCH 采用乐观更新，失败后回滚并显示中文错误。`truncated`、
+`redacted`、binary 和预算失败均有独立、非仅颜色的提示。
+
+### 6.9 GitHub Review 安全发布
+
+ReviewDiff 新增 `source: working_tree|pull_request`。`working_tree` 继续使用
+`scope=staged|unstaged|all`，且 `repository/pr_number/head_revision` 不形成可发布身份；
+`pull_request` 固定 `scope=all`，并保存已验证的 `repository`、`pr_number`、`base_revision`
+和 `head_revision`。本地未提交代码禁止发布，不会自动寻找或映射到 PR。
+
+项目级 capability 是只读查询：
+
+```http
+GET /api/projects/{project_id}/github-review/capability
+```
+
+返回 `gh_installed`、`authenticated`、`remote_found`、`publish_enabled`、`can_publish`、
+受控 `reason`、repository、current_user 和最多 20 个 open PR。PR 字段为 pr_number、title、
+canonical GitHub URL、state/draft、base/head branch、base/head SHA、author 和 repository。
+owner/repo 只能从 registered project 的 origin 推导，前端不能覆盖。多个 origin URL
+必须解析为同一仓库；非 github.com、缺少 origin 或非法 owner/repo 都返回受控状态。
+
+发起 PR Review：
+
+```http
+POST /api/threads/{thread_id}/review-runs
+Content-Type: application/json
+
+{"scope":"all","source":"pull_request","pr_number":42}
+```
+
+后端再次验证 PR 属于当前仓库，并通过只读 `gh api` 获取 PR 和文件。远端 patch 仍执行
+第 35 课路径、容量、脱敏、二进制/子模块和提示词注入隔离；缺失 patch 标记为
+`github_patch_unavailable`。不 checkout、fetch、reset、merge 或修改工作树。
+
+发布预览：
+
+```http
+POST /api/runs/{run_id}/github-review/prepare
+Content-Type: application/json
+
+{
+  "pr_number": 42,
+  "selected_finding_ids": ["finding-id"],
+  "event": "REQUEST_CHANGES",
+  "summary": "请先处理已验证的问题。"
+}
+```
+
+仅 `open` Finding 默认选中。`new -> RIGHT`、`old -> LEFT`；多行范围使用 `line/side` 和
+`start_line/start_side`。文件级、全局和二进制 Finding 明示进入总结；Diff 外、不可见
+截断区或错误 side 会被拒绝，不猜测旧 position。prepare 返回 publication_id、仓库/PR、
+base/head SHA、event、行内/总结/跳过项、warnings、summary body、payload hash 和 expires_at，
+且不访问写接口。
+
+用户确认后只提交 publication_id：
+
+```http
+POST /api/runs/{run_id}/github-review/publish
+Content-Type: application/json
+
+{"publication_id":"uuid"}
+```
+
+后端原子地把 `prepared|failed` 认领为 `publishing`，然后重新验证过期时间、Run 归属、
+payload/Finding 状态、仓库、PR open/draft 和 head SHA。一次固定 GitHub Review POST 通过
+JSON stdin 发送 commit_id、受控 body、event 和 comments。相同 payload 的
+`publishing|published|unknown` 记录阻止第二次写入。普通 API 失败为 `failed`；写请求
+超时或成功响应无法确认时为 `unknown`，禁止自动重试。审计查询：
+
+```http
+GET /api/runs/{run_id}/github-review/publications
+```
+
+响应不含 GitHub payload、评论原文、Diff、token、凭据路径或主机路径。稳定错误码：
+
+```text
+gh_not_installed github_not_authenticated github_remote_not_found
+unsupported_github_host pull_request_not_found pull_request_closed
+pull_request_changed pull_request_draft permission_denied
+review_not_publishable finding_not_publishable publication_expired
+publication_changed publication_already_published publication_in_progress
+publication_result_unknown github_timeout github_api_error publishing_disabled
+```
+
+前端将错误映射为中文。确认弹窗展示仓库、PR、Review 类型、行内/总结/跳过数量、head SHA
+和真实外部写入警告；按钮文案固定为“发布到 GitHub”。打开弹窗、取消、Enter、刷新均
+不会发布。发布配置见 `.env.example`，测试必须注入 fake runner，禁止访问真实 GitHub。
+
+离线安全测试命令：
+
+```bash
+uv run pytest tests/test_github_review.py -q
+cd frontend && npm test
+```
+
+后端测试的 `FakeGitHubRunner` 提供认证、PR/files、发布成功/失败/超时响应，并记录 argv 与
+JSON stdin；测试中不解析用户 gh 配置、不连接网络，也不可能向真实 PR 发布评论。
+
+第 38 课应用内 Browser 仍返回 `No browser is available`，随后复用系统 Chrome 150 与
+Playwright 请求拦截完成 1440x900、1280x720、768x1024、390x844 四种视口。E2E 使用
+fixture API，不连接真实 GitHub；覆盖工作树禁用发布、PR Finding 选择、预览取消、
+明确确认、成功/失败/unknown、Enter 不发布、重复点击锁定、old/new/文件级定位、滚动和
+控制台/未处理请求检查。截图与结果见 `docs/lesson-38-acceptance.md`。
+
+平板验收发现全局侧栏压缩 Review 工具栏，已在 761-1024px 的 Review 视图隐藏侧栏；
+移动弹窗的长 PR 标题现在使用省略显示并保留外链图标。真实 GitHub COMMENT 仍因 gh
+Token 失效且无专用测试 PR 而 blocked，不能把 mock 结果描述为真实发布。
+
 ## 7. Run SSE 接口
 
 ```http
@@ -374,6 +865,7 @@ tool_finished
 completed
 failed
 terminated
+review_findings_saved
 ```
 
 事件来源：
@@ -398,6 +890,12 @@ terminated
 
 `created` 和 `running` 生命周期事件会携带 `task_kind` 与 `budget`；文本和工具事件
 不重复携带这些字段。
+第 39 课起生命周期事件还携带 `network_access`、`network_provider` 和
+`network_budget`，用于展示本 Run 的实际快照。
+
+`review_findings_saved` 由 Reviewer 校验并保存完一批结果后产生，携带
+`created_count`、`duplicate_count`、`rejected_count` 和 `summary`。它不是 Run 终态；
+Reviewer 解析失败会产生来源为 `reviewer` 的 `failed` 事件，并把 Run 写为 `failed`。
 
 工具事件示例：
 
@@ -446,6 +944,79 @@ terminated
 工具执行失败时，`tool_finished` 可以携带 `status: "error"` 和
 `recoverable: true`。这是工具步骤失败，不代表整个 Run 已失败；前端只能使用
 `created/running/completed/failed/terminated` 生命周期事件更新 Run 状态。
+
+工作区搜索开始事件不会包含原始 `query`，完成事件不会包含文件内容、`snippet` 或完整
+`matches`。前端只获得定位进度所需的安全元数据：
+
+```json
+{
+  "name": "workspace_search",
+  "tool_call_id": "call-search-1",
+  "path": "/projects/demo",
+  "file_pattern": "**/*.py",
+  "max_results": 100
+}
+```
+
+```json
+{
+  "name": "workspace_search",
+  "tool_call_id": "call-search-1",
+  "status": "completed",
+  "recoverable": false,
+  "match_count": 3,
+  "files_searched": 12,
+  "skipped_file_count": 1,
+  "scanned_bytes": 4096,
+  "duration_ms": 4.0,
+  "truncated": true
+}
+```
+
+`workspace_glob` 的开始事件使用 `pattern`，完成事件使用 `match_count`、
+`scanned_entry_count`、`duration_ms` 和 `truncated`。React 执行步骤会显示“正在定位文件”
+或“正在搜索代码”，完成后显示匹配数、扫描文件数、耗时和截断状态。
+
+`web_search` 开始事件只包含安全查询预览、固定 provider 和 `max_results`：
+
+```json
+{
+  "name": "web_search",
+  "tool_call_id": "call-search-1",
+  "query": "FastAPI latest docs",
+  "provider": "zhipu",
+  "max_results": 5
+}
+```
+
+完成事件不包含 snippet 或 provider 原始响应，只包含计数、耗时、缓存/截断状态和安全
+来源：
+
+```json
+{
+  "name": "web_search",
+  "tool_call_id": "call-search-1",
+  "status": "completed",
+  "recoverable": false,
+  "result_count": 1,
+  "duration_ms": 82.4,
+  "cached": false,
+  "truncated": false,
+  "sources": [
+    {
+      "citation_id": "S1",
+      "title": "FastAPI Documentation",
+      "url": "https://fastapi.tiangolo.com/"
+    }
+  ]
+}
+```
+
+失败事件使用稳定 `error_code`、中文 `error` 和 `recoverable=true`。稳定代码包括
+`network_access_disabled`、`network_provider_unavailable`、
+`network_sensitive_input_rejected`、`network_search_limit`、`network_result_limit`、
+`network_timeout`、`network_provider_error` 和 `network_invalid_result`。参数问题使用
+`network_invalid_request`。这些是工具级可恢复错误，不会单独让 Run 停留在 running。
 
 接口支持 SSE `Last-Event-ID` 续传。后端将其转换为 SQLite `after_id`，只返回游标之后的事件。
 
@@ -844,7 +1415,9 @@ Content-Type: application/json
 - 当前分支的 upstream 是对应的 `origin/{current_branch}`。
 - 后端主机已经安装 GitHub CLI，并通过 `gh auth login` 登录 `github.com`。
 
-后端只允许执行 `gh auth status --hostname github.com` 和固定参数顺序的 `gh pr create`。成功时返回 `201 Created`：
+Repository PR 创建执行器只允许 `gh auth status --hostname github.com` 和固定参数顺序的
+`gh pr create`。第 37 课 GitHub Review 使用 6.9 节的独立宿主机 runner 和固定
+`gh api` endpoint/JSON stdin；两者都不暴露给 Agent。PR 创建成功时返回 `201 Created`：
 
 ```json
 {
@@ -885,7 +1458,7 @@ Repository 接口统一状态码：
 | `422 Unprocessable Content` | URL、仓库名、请求体或分支名不合法 |
 | `503 Service Unavailable` | GitHub CLI 未安装或未登录 |
 
-## 11. 当前缺失能力
+## 11. 当前能力状态
 
 | 前端目标 | 当前状态 |
 | --- | --- |
@@ -905,6 +1478,7 @@ Repository 接口统一状态码：
 | Run 生命周期事件 | 已支持 |
 | 工具调用步骤 | 已支持，按 `tool_call_id` 归并 |
 | 子 Agent 步骤 | 已支持，按 `source` 区分来源 |
+| 工作区文件增删统计 | 已支持，执行侧栏显示累计 Git 工作区改动 |
 | Planning 确认后实施 | 已支持，确认后切换 Coding 并预填请求 |
 | 取消 Run | 未支持 |
 | 专用重试接口 | 未支持 |
@@ -912,6 +1486,9 @@ Repository 接口统一状态码：
 | Git commit | 已支持，提交全部非敏感修改 |
 | Git push | 已支持，固定 `origin`，禁止直接推送 `main/master` |
 | GitHub Pull Request | 已支持，使用受限 GitHub CLI |
+| 结构化 Review Finding | 已支持，按 `run_id` 保存、筛选和更新状态 |
+| 完整 Review 面板 | 已支持，快照文件树、结构化 Diff、Finding 定位/筛选/状态；四视口 Chrome 验收通过 |
+| GitHub Review 发布 | 已支持，PR 快照、prepare/confirm/publish、SHA 校验、幂等和 unknown 状态 |
 | 文件或图片上传 | 未支持 |
 | 历史分页 | 未支持 |
 
@@ -928,7 +1505,11 @@ Repository 接口统一状态码：
 9. 接入本地仓库发现、GitHub HTTPS clone、fetch 和本地分支操作。
 10. 接入用户确认后的 commit、固定 origin push 和受限 GitHub CLI Pull Request。
 11. 实现先方案后实施。
-12. 实现 Reviewer 和端到端验收。
+12. 接入结构化 Reviewer Finding（已完成）。
+13. 安全 Git Diff、结构化 hunk 与 old/new 行号核对（已完成）。
+14. 实现完整 Review 面板（已完成；系统 Chrome 四视口视觉验收通过）。
+15. 实现用户确认后的 GitHub Review 发布（已完成）。
+16. 在专用测试 PR 完成真实端到端验收（第 38 课本地/mock 阶段完成；真实阶段 blocked）。
 
 ## 13. 当前结论
 
@@ -944,4 +1525,4 @@ Repository 接口统一状态码：
 → 终态后刷新 Run 与消息快照
 ```
 
-仓库链路现已覆盖发现、clone、fetch、分支、commit、push 和 Pull Request，聊天链路也已支持 Planning 方案确认后切换 Coding。下一阶段进入 Reviewer 与端到端验收，并继续保持平台源码、Agent 工作区、GitHub 凭据和用户确认之间的边界。
+仓库链路现已覆盖发现、clone、fetch、分支、commit、push、Pull Request 和用户确认后的 GitHub Review。Reviewer 按 Run 保存工作树或 PR Diff 快照和严格校验的 Finding；前端可浏览、定位、选择、预览并确认发布。第 38 课的完整回归、mock E2E、四视口视觉检查、性能基线和重启审计已经完成；真实 GitHub COMMENT、APPROVE、REQUEST_CHANGES 仍须在认证恢复后的专用测试 PR 上逐次授权，继续保持平台源码、Agent 工作区、GitHub 凭据和用户确认之间的边界。

@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Protocol
 
 from pydantic import (
@@ -20,6 +20,14 @@ from pydantic import (
 )
 
 from app.backends.workspace import Workspace, WorkspacePathError
+from app.core.review_diff import (
+    ReviewDiff,
+    ReviewDiffFile,
+    ReviewLineSide,
+    ReviewScope,
+    redact_sensitive_patch,
+    visible_lines_for_file,
+)
 
 
 class ReviewSeverity(StrEnum):
@@ -53,10 +61,15 @@ class ReviewFindingDraft:
     file_path: str | None
     start_line: int | None
     end_line: int | None
+    line_side: ReviewLineSide | None
     title: str
     description: str
     suggestion: str | None
     fingerprint: str
+    review_diff_hash: str | None
+    review_scope: ReviewScope | None
+    base_revision: str | None
+    head_revision: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,11 +81,16 @@ class ReviewFindingSnapshot:
     file_path: str | None
     start_line: int | None
     end_line: int | None
+    line_side: ReviewLineSide | None
     title: str
     description: str
     suggestion: str | None
     status: ReviewFindingStatus
     fingerprint: str
+    review_diff_hash: str | None
+    review_scope: ReviewScope | None
+    base_revision: str | None
+    head_revision: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -87,6 +105,7 @@ class ModelReviewFinding(BaseModel):
     file_path: str | None
     start_line: int | None = Field(default=None, strict=True, ge=1)
     end_line: int | None = Field(default=None, strict=True, ge=1)
+    line_side: ReviewLineSide | None = None
     title: str = Field(min_length=1, max_length=200)
     description: str = Field(min_length=1, max_length=10_000)
     suggestion: str | None = Field(default=None, max_length=10_000)
@@ -123,15 +142,25 @@ class ModelReviewFinding(BaseModel):
         if not self.description:
             raise ValueError("description 不能为空")
 
-        location = (self.file_path, self.start_line, self.end_line)
-        if all(value is None for value in location):
+        if self.file_path is None:
+            if any(
+                value is not None
+                for value in (self.start_line, self.end_line, self.line_side)
+            ):
+                raise ValueError(
+                    "file_path、start_line、end_line 必须同时提供；"
+                    "全局 Finding 不能提供行号或 line_side"
+                )
             return self
-        if any(value is None for value in location):
+
+        if self.start_line is None and self.end_line is None:
+            if self.line_side is not None:
+                raise ValueError("文件级 Finding 不能提供 line_side")
+            return self
+        if self.start_line is None or self.end_line is None:
             raise ValueError(
-                "file_path、start_line、end_line 必须同时提供或同时为空"
+                "start_line、end_line 必须同时提供或同时为空"
             )
-        assert self.start_line is not None
-        assert self.end_line is not None
         if self.end_line < self.start_line:
             raise ValueError("end_line 不能小于 start_line")
         return self
@@ -223,15 +252,28 @@ def _normalized_title(value: str) -> str:
 def review_fingerprint(
     finding: ReviewFindingDraft | ModelReviewFinding,
     file_path: str | None = None,
+    *,
+    line_side: ReviewLineSide | None = None,
+    review_diff_hash: str | None = None,
 ) -> str:
     canonical_path = file_path if file_path is not None else finding.file_path
     payload = {
         "file_path": canonical_path,
         "start_line": finding.start_line,
         "end_line": finding.end_line,
+        "line_side": (
+            line_side.value
+            if line_side is not None
+            else (
+                finding.line_side.value
+                if finding.line_side is not None
+                else None
+            )
+        ),
         "severity": finding.severity.value,
         "category": finding.category.value,
         "title": _normalized_title(finding.title),
+        "review_diff_hash": review_diff_hash,
     }
     encoded = json.dumps(
         payload,
@@ -253,6 +295,10 @@ def normalize_review_file_path(
     raw_path = file_path.strip()
     if not raw_path:
         raise ReviewOutputError("file_path 不能为空")
+    if PureWindowsPath(raw_path).drive:
+        raise ReviewOutputError(
+            "file_path 不是安全的虚拟工作区路径"
+        )
 
     try:
         project_real_path = workspace.resolve(project_virtual_path)
@@ -288,6 +334,8 @@ class ReviewFindingService:
         *,
         run_id: str,
         raw_output: Any,
+        review_diff: ReviewDiff | None = None,
+        require_review_diff: bool = False,
     ) -> ReviewSaveResult:
         run = self.store.get_run(run_id)
         if run is None:
@@ -300,6 +348,10 @@ class ReviewFindingService:
             raise KeyError(f"Project 不存在：{thread.project_id}")
 
         output = parse_reviewer_output(raw_output)
+        if require_review_diff and review_diff is None:
+            raise ReviewOutputError(
+                "Reviewer 缺少本次受控 ReviewDiff，拒绝持久化 Finding"
+            )
         unique: dict[str, ReviewFindingDraft] = {}
         for model_finding in output.findings:
             canonical_path = None
@@ -309,9 +361,36 @@ class ReviewFindingService:
                     project_virtual_path=project.virtual_path,
                     file_path=model_finding.file_path,
                 )
+            line_side = model_finding.line_side
+            if (
+                line_side is None
+                and review_diff is None
+                and model_finding.start_line is not None
+            ):
+                # 第 34 课历史输出没有 line_side，默认按新文件侧保存。
+                line_side = ReviewLineSide.NEW
+            if review_diff is not None:
+                line_side = self._validate_diff_location(
+                    finding=model_finding,
+                    canonical_path=canonical_path,
+                    review_diff=review_diff,
+                )
             fingerprint = review_fingerprint(
                 model_finding,
                 file_path=canonical_path,
+                line_side=line_side,
+                review_diff_hash=(
+                    review_diff.content_hash
+                    if review_diff is not None
+                    else None
+                ),
+            )
+            title = redact_sensitive_patch(model_finding.title)
+            description = redact_sensitive_patch(model_finding.description)
+            suggestion = (
+                redact_sensitive_patch(model_finding.suggestion)
+                if model_finding.suggestion is not None
+                else None
             )
             unique.setdefault(
                 fingerprint,
@@ -321,10 +400,31 @@ class ReviewFindingService:
                     file_path=canonical_path,
                     start_line=model_finding.start_line,
                     end_line=model_finding.end_line,
-                    title=model_finding.title,
-                    description=model_finding.description,
-                    suggestion=model_finding.suggestion,
+                    line_side=line_side,
+                    title=title,
+                    description=description,
+                    suggestion=suggestion,
                     fingerprint=fingerprint,
+                    review_diff_hash=(
+                        review_diff.content_hash
+                        if review_diff is not None
+                        else None
+                    ),
+                    review_scope=(
+                        review_diff.scope
+                        if review_diff is not None
+                        else None
+                    ),
+                    base_revision=(
+                        review_diff.base_revision
+                        if review_diff is not None
+                        else None
+                    ),
+                    head_revision=(
+                        review_diff.head_revision
+                        if review_diff is not None
+                        else None
+                    ),
                 ),
             )
 
@@ -337,4 +437,61 @@ class ReviewFindingService:
             summary=output.summary,
             created_count=created_count,
             duplicate_count=len(output.findings) - created_count,
+        )
+
+    @staticmethod
+    def _validate_diff_location(
+        *,
+        finding: ModelReviewFinding,
+        canonical_path: str | None,
+        review_diff: ReviewDiff,
+    ) -> ReviewLineSide | None:
+        if canonical_path is None:
+            return None
+
+        candidates: list[tuple[ReviewDiffFile, ReviewLineSide]] = []
+        for file in review_diff.files:
+            if canonical_path == file.new_path:
+                candidates.append((file, ReviewLineSide.NEW))
+            if canonical_path == file.old_path:
+                candidates.append((file, ReviewLineSide.OLD))
+        if not candidates:
+            raise ReviewOutputError(
+                "Finding file_path 不在本次受控 Diff 中"
+            )
+
+        if finding.start_line is None or finding.end_line is None:
+            return None
+
+        if any(file.binary for file, _ in candidates):
+            raise ReviewOutputError("二进制文件只能产生文件级 Finding")
+
+        requested_side = finding.line_side
+        if requested_side is not None:
+            candidates = [
+                item for item in candidates if item[1] is requested_side
+            ]
+            if not candidates:
+                raise ReviewOutputError(
+                    "Finding line_side 与 Diff 文件路径不一致"
+                )
+
+        requested_lines = set(
+            range(finding.start_line, finding.end_line + 1)
+        )
+        for file, side in candidates:
+            changed_lines = set(
+                file.changed_old_lines
+                if side is ReviewLineSide.OLD
+                else file.changed_new_lines
+            )
+            visible_lines = visible_lines_for_file(file, side)
+            if (
+                requested_lines <= visible_lines
+                and requested_lines & changed_lines
+            ):
+                return side
+
+        raise ReviewOutputError(
+            "Finding 行号不属于模型实际看到的 Diff 变更区域"
         )

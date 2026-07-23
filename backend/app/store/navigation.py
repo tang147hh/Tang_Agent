@@ -26,6 +26,20 @@ from app.core.review import (
     ReviewFindingStatus,
     ReviewSeverity,
 )
+from app.core.review_diff import (
+    ReviewDiff,
+    ReviewDiffSnapshot,
+    ReviewLineSide,
+    ReviewScope,
+    ReviewSnapshotStatus,
+    review_diff_from_dict,
+    review_diff_to_dict,
+)
+from app.core.github_review import (
+    GitHubPublicationStatus,
+    GitHubReviewEvent,
+    GitHubReviewPublicationSnapshot,
+)
 
 
 class SQLiteProjectThreadStore:
@@ -98,6 +112,14 @@ class SQLiteProjectThreadStore:
                     task_kind TEXT NOT NULL,
                     status TEXT NOT NULL,
                     error TEXT,
+                    network_access INTEGER NOT NULL DEFAULT 0,
+                    network_provider TEXT NOT NULL DEFAULT 'disabled',
+                    network_request_count INTEGER NOT NULL DEFAULT 0,
+                    network_result_count INTEGER NOT NULL DEFAULT 0,
+                    network_bytes_received INTEGER NOT NULL DEFAULT 0,
+                    network_cache_hit_count INTEGER NOT NULL DEFAULT 0,
+                    network_limit_reached INTEGER NOT NULL DEFAULT 0,
+                    network_limit_reason TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY (thread_id)
@@ -117,6 +139,21 @@ class SQLiteProjectThreadStore:
                     "ALTER TABLE runs ADD COLUMN task_kind TEXT "
                     "NOT NULL DEFAULT 'qa'"
                 )
+            run_column_migrations = {
+                "network_access": "INTEGER NOT NULL DEFAULT 0",
+                "network_provider": "TEXT NOT NULL DEFAULT 'disabled'",
+                "network_request_count": "INTEGER NOT NULL DEFAULT 0",
+                "network_result_count": "INTEGER NOT NULL DEFAULT 0",
+                "network_bytes_received": "INTEGER NOT NULL DEFAULT 0",
+                "network_cache_hit_count": "INTEGER NOT NULL DEFAULT 0",
+                "network_limit_reached": "INTEGER NOT NULL DEFAULT 0",
+                "network_limit_reason": "TEXT",
+            }
+            for column, definition in run_column_migrations.items():
+                if column not in run_columns:
+                    connection.execute(
+                        f"ALTER TABLE runs ADD COLUMN {column} {definition}"
+                    )
 
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
@@ -191,6 +228,9 @@ class SQLiteProjectThreadStore:
                     file_path TEXT,
                     start_line INTEGER,
                     end_line INTEGER,
+                    line_side TEXT CHECK (
+                        line_side IS NULL OR line_side IN ('old', 'new')
+                    ),
                     title TEXT NOT NULL,
                     description TEXT NOT NULL,
                     suggestion TEXT,
@@ -198,6 +238,13 @@ class SQLiteProjectThreadStore:
                         status IN ('open', 'resolved', 'dismissed')
                     ),
                     fingerprint TEXT NOT NULL,
+                    review_diff_hash TEXT,
+                    review_scope TEXT CHECK (
+                        review_scope IS NULL OR
+                        review_scope IN ('staged', 'unstaged', 'all')
+                    ),
+                    base_revision TEXT,
+                    head_revision TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY (run_id)
@@ -205,12 +252,75 @@ class SQLiteProjectThreadStore:
                         ON DELETE CASCADE,
                     CHECK (
                         (file_path IS NULL AND start_line IS NULL
-                            AND end_line IS NULL)
+                            AND end_line IS NULL AND line_side IS NULL)
                         OR
-                        (file_path IS NOT NULL AND start_line > 0
-                            AND end_line >= start_line)
+                        (file_path IS NOT NULL
+                            AND start_line IS NULL
+                            AND end_line IS NULL
+                            AND line_side IS NULL)
+                        OR
+                        (file_path IS NOT NULL
+                            AND start_line IS NOT NULL
+                            AND end_line IS NOT NULL
+                            AND start_line > 0
+                            AND end_line >= start_line
+                            AND line_side IN ('old', 'new'))
                     ),
                     UNIQUE (run_id, fingerprint)
+                )
+                """)
+
+            self._upgrade_review_findings_schema(connection)
+
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS review_diff_snapshots (
+                    run_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('collected', 'completed', 'failed')
+                    ),
+                    payload_json TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id)
+                        REFERENCES runs(run_id)
+                        ON DELETE CASCADE
+                )
+                """)
+
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS github_review_publications (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    repository TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    base_sha TEXT NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    event TEXT NOT NULL CHECK (
+                        event IN ('COMMENT', 'APPROVE', 'REQUEST_CHANGES')
+                    ),
+                    selected_finding_ids_json TEXT NOT NULL,
+                    finding_state_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    preview_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'prepared', 'publishing', 'published',
+                            'failed', 'unknown'
+                        )
+                    ),
+                    github_review_id TEXT,
+                    github_review_url TEXT,
+                    github_user TEXT,
+                    prepared_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    published_at TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    FOREIGN KEY (run_id)
+                        REFERENCES runs(run_id)
+                        ON DELETE CASCADE
                 )
                 """)
 
@@ -244,6 +354,123 @@ class SQLiteProjectThreadStore:
                     idx_review_findings_run_filters
                 ON review_findings(run_id, severity, status)
                 """)
+
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS
+                    idx_github_review_publications_run
+                ON github_review_publications(run_id, prepared_at DESC)
+                """)
+
+            connection.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    idx_github_review_publications_published_payload
+                ON github_review_publications(payload_hash)
+                WHERE status = 'published'
+                """)
+
+            connection.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    idx_github_review_publications_active_payload
+                ON github_review_publications(payload_hash)
+                WHERE status IN ('publishing', 'published', 'unknown')
+                """)
+
+    @staticmethod
+    def _upgrade_review_findings_schema(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """把第 34 课表无损升级为支持 Diff 定位的第 35 课结构。"""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(review_findings)"
+            ).fetchall()
+        }
+        required = {
+            "line_side",
+            "review_diff_hash",
+            "review_scope",
+            "base_revision",
+            "head_revision",
+        }
+        if required <= columns:
+            return
+
+        connection.execute("DROP TABLE IF EXISTS review_findings_v35")
+        connection.execute("""
+            CREATE TABLE review_findings_v35 (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                severity TEXT NOT NULL CHECK (
+                    severity IN ('critical', 'high', 'medium', 'low')
+                ),
+                category TEXT NOT NULL CHECK (
+                    category IN (
+                        'correctness', 'security', 'performance',
+                        'maintainability', 'testing', 'documentation'
+                    )
+                ),
+                file_path TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                line_side TEXT CHECK (
+                    line_side IS NULL OR line_side IN ('old', 'new')
+                ),
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                suggestion TEXT,
+                status TEXT NOT NULL CHECK (
+                    status IN ('open', 'resolved', 'dismissed')
+                ),
+                fingerprint TEXT NOT NULL,
+                review_diff_hash TEXT,
+                review_scope TEXT CHECK (
+                    review_scope IS NULL OR
+                    review_scope IN ('staged', 'unstaged', 'all')
+                ),
+                base_revision TEXT,
+                head_revision TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (run_id)
+                    REFERENCES runs(run_id)
+                    ON DELETE CASCADE,
+                CHECK (
+                    (file_path IS NULL AND start_line IS NULL
+                        AND end_line IS NULL AND line_side IS NULL)
+                    OR
+                    (file_path IS NOT NULL AND start_line IS NULL
+                        AND end_line IS NULL AND line_side IS NULL)
+                    OR
+                    (file_path IS NOT NULL AND start_line IS NOT NULL
+                        AND end_line IS NOT NULL AND start_line > 0
+                        AND end_line >= start_line
+                        AND line_side IN ('old', 'new'))
+                ),
+                UNIQUE (run_id, fingerprint)
+            )
+            """)
+        connection.execute("""
+            INSERT INTO review_findings_v35 (
+                id, run_id, severity, category, file_path,
+                start_line, end_line, line_side, title, description,
+                suggestion, status, fingerprint, review_diff_hash,
+                review_scope, base_revision, head_revision,
+                created_at, updated_at
+            )
+            SELECT
+                id, run_id, severity, category, file_path,
+                start_line, end_line,
+                CASE WHEN start_line IS NULL THEN NULL ELSE 'new' END,
+                title, description, suggestion, status, fingerprint,
+                NULL, NULL, NULL, NULL, created_at, updated_at
+            FROM review_findings
+            """)
+        connection.execute("DROP TABLE review_findings")
+        connection.execute(
+            "ALTER TABLE review_findings_v35 RENAME TO review_findings"
+        )
 
     def create_project(
         self,
@@ -421,6 +648,8 @@ class SQLiteProjectThreadStore:
         thread_id: str,
         content: str,
         task_kind: TaskKind = TaskKind.QA,
+        network_access: bool = False,
+        network_provider: str = "disabled",
     ) -> tuple[RunSnapshot, MessageSnapshot]:
         normalized_content = content.strip()
 
@@ -459,16 +688,20 @@ class SQLiteProjectThreadStore:
                         task_kind,
                         status,
                         error,
+                        network_access,
+                        network_provider,
                         created_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, ?, NULL, ?, ?)
+                    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
                         thread_id,
                         task_kind.value,
                         RunStatus.PENDING.value,
+                        int(network_access),
+                        network_provider,
                         now,
                         now,
                     ),
@@ -556,6 +789,8 @@ class SQLiteProjectThreadStore:
         *,
         thread_id: str,
         task_kind: TaskKind = TaskKind.QA,
+        network_access: bool = False,
+        network_provider: str = "disabled",
     ) -> RunSnapshot:
         run_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
@@ -582,16 +817,20 @@ class SQLiteProjectThreadStore:
                         task_kind,
                         status,
                         error,
+                        network_access,
+                        network_provider,
                         created_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, ?, NULL, ?, ?)
+                    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
                         thread_id,
                         task_kind.value,
                         RunStatus.PENDING.value,
+                        int(network_access),
+                        network_provider,
                         now,
                         now,
                     ),
@@ -787,6 +1026,58 @@ class SQLiteProjectThreadStore:
             return None
         return self._run_performance_snapshot(row)
 
+    def update_run_network_metrics(
+        self,
+        *,
+        run_id: str,
+        request_count: int,
+        result_count: int,
+        bytes_received: int,
+        cache_hit_count: int,
+        limit_reached: bool,
+        limit_reason: str | None,
+    ) -> RunSnapshot:
+        values = (
+            request_count,
+            result_count,
+            bytes_received,
+            cache_hit_count,
+        )
+        if any(value < 0 for value in values):
+            raise ValueError("Run 网络指标不能小于 0")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE runs
+                SET network_request_count = ?,
+                    network_result_count = ?,
+                    network_bytes_received = ?,
+                    network_cache_hit_count = ?,
+                    network_limit_reached = ?,
+                    network_limit_reason = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    request_count,
+                    result_count,
+                    bytes_received,
+                    cache_hit_count,
+                    int(limit_reached),
+                    limit_reason,
+                    now,
+                    run_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Run 不存在：{run_id}")
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return self._run_snapshot(row)
+
     def add_review_findings(
         self,
         *,
@@ -812,10 +1103,13 @@ class SQLiteProjectThreadStore:
                     """
                     INSERT OR IGNORE INTO review_findings (
                         id, run_id, severity, category, file_path,
-                        start_line, end_line, title, description,
-                        suggestion, status, fingerprint, created_at,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        start_line, end_line, line_side, title, description,
+                        suggestion, status, fingerprint, review_diff_hash,
+                        review_scope, base_revision, head_revision,
+                        created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
                     """,
                     (
                         str(uuid.uuid4()),
@@ -825,11 +1119,24 @@ class SQLiteProjectThreadStore:
                         finding.file_path,
                         finding.start_line,
                         finding.end_line,
+                        (
+                            finding.line_side.value
+                            if finding.line_side is not None
+                            else None
+                        ),
                         finding.title,
                         finding.description,
                         finding.suggestion,
                         ReviewFindingStatus.OPEN.value,
                         finding.fingerprint,
+                        finding.review_diff_hash,
+                        (
+                            finding.review_scope.value
+                            if finding.review_scope is not None
+                            else None
+                        ),
+                        finding.base_revision,
+                        finding.head_revision,
                         now,
                         now,
                     ),
@@ -851,6 +1158,288 @@ class SQLiteProjectThreadStore:
 
         snapshots = [self._review_finding_snapshot(row) for row in rows]
         return self._sort_review_findings(snapshots), created_count
+
+    def save_review_diff_snapshot(
+        self,
+        *,
+        run_id: str,
+        review_diff: ReviewDiff,
+        summary: str,
+    ) -> ReviewDiffSnapshot:
+        """首次保存 Reviewer 实际看到的受控 Diff；同一 Run 不允许覆盖。"""
+
+        now = datetime.now(timezone.utc).isoformat()
+        payload_json = json.dumps(
+            review_diff_to_dict(review_diff),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        try:
+            with self._connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO review_diff_snapshots (
+                        run_id, status, payload_json, summary,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        ReviewSnapshotStatus.COLLECTED.value,
+                        payload_json,
+                        summary,
+                        now,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM review_diff_snapshots WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("当前 Run 已经存在代码审查快照") from exc
+        return self._review_diff_snapshot(row)
+
+    def get_review_diff_snapshot(
+        self,
+        run_id: str,
+    ) -> ReviewDiffSnapshot | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM review_diff_snapshots WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._review_diff_snapshot(row)
+
+    def create_github_review_publication(
+        self,
+        *,
+        publication_id: str,
+        run_id: str,
+        repository: str,
+        pr_number: int,
+        base_sha: str,
+        head_sha: str,
+        event: GitHubReviewEvent,
+        selected_finding_ids: tuple[str, ...],
+        finding_state_hash: str,
+        payload: dict[str, Any],
+        preview: dict[str, Any],
+        payload_hash: str,
+        prepared_at: datetime,
+        expires_at: datetime,
+    ) -> GitHubReviewPublicationSnapshot:
+        with self._connection() as connection:
+            if connection.execute(
+                "SELECT run_id FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone() is None:
+                raise KeyError(f"Run 不存在：{run_id}")
+            connection.execute(
+                """
+                INSERT INTO github_review_publications (
+                    id, run_id, repository, pr_number, base_sha, head_sha,
+                    event, selected_finding_ids_json, finding_state_hash,
+                    payload_json, preview_json, payload_hash, status,
+                    prepared_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    publication_id,
+                    run_id,
+                    repository,
+                    pr_number,
+                    base_sha,
+                    head_sha,
+                    event.value,
+                    json.dumps(list(selected_finding_ids), ensure_ascii=False),
+                    finding_state_hash,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    json.dumps(preview, ensure_ascii=False, sort_keys=True),
+                    payload_hash,
+                    GitHubPublicationStatus.PREPARED.value,
+                    prepared_at.isoformat(),
+                    expires_at.isoformat(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM github_review_publications WHERE id = ?",
+                (publication_id,),
+            ).fetchone()
+            return self._github_review_publication(row)
+
+    def get_github_review_publication(
+        self,
+        publication_id: str,
+    ) -> GitHubReviewPublicationSnapshot | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM github_review_publications WHERE id = ?",
+                (publication_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._github_review_publication(row)
+
+    def list_github_review_publications(
+        self,
+        run_id: str,
+    ) -> list[GitHubReviewPublicationSnapshot]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM github_review_publications
+                WHERE run_id = ?
+                ORDER BY prepared_at DESC, id DESC
+                """,
+                (run_id,),
+            ).fetchall()
+        return [self._github_review_publication(row) for row in rows]
+
+    def find_published_github_review_payload(
+        self,
+        payload_hash: str,
+    ) -> GitHubReviewPublicationSnapshot | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM github_review_publications
+                WHERE payload_hash = ? AND status = 'published'
+                LIMIT 1
+                """,
+                (payload_hash,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._github_review_publication(row)
+
+    def claim_github_review_publication(
+        self,
+        publication_id: str,
+    ) -> GitHubReviewPublicationSnapshot:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM github_review_publications WHERE id = ?",
+                (publication_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("publication not found")
+            current = GitHubPublicationStatus(str(row["status"]))
+            if current is GitHubPublicationStatus.PUBLISHED:
+                raise ValueError("publication_already_published")
+            if current is GitHubPublicationStatus.PUBLISHING:
+                raise ValueError("publication_in_progress")
+            if current is GitHubPublicationStatus.UNKNOWN:
+                raise ValueError("publication_result_unknown")
+            conflict = connection.execute(
+                """
+                SELECT status FROM github_review_publications
+                WHERE payload_hash = ? AND id != ?
+                  AND status IN ('publishing', 'published', 'unknown')
+                LIMIT 1
+                """,
+                (row["payload_hash"], publication_id),
+            ).fetchone()
+            if conflict is not None:
+                conflict_status = GitHubPublicationStatus(
+                    str(conflict["status"])
+                )
+                if conflict_status is GitHubPublicationStatus.PUBLISHED:
+                    raise ValueError("publication_already_published")
+                if conflict_status is GitHubPublicationStatus.UNKNOWN:
+                    raise ValueError("publication_result_unknown")
+                raise ValueError("publication_in_progress")
+            cursor = connection.execute(
+                """
+                UPDATE github_review_publications
+                SET status = 'publishing', error_code = NULL,
+                    error_message = NULL
+                WHERE id = ? AND status IN ('prepared', 'failed')
+                """,
+                (publication_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("publication_in_progress")
+            claimed = connection.execute(
+                "SELECT * FROM github_review_publications WHERE id = ?",
+                (publication_id,),
+            ).fetchone()
+            return self._github_review_publication(claimed)
+
+    def finish_github_review_publication(
+        self,
+        *,
+        publication_id: str,
+        status: GitHubPublicationStatus,
+        github_review_id: str | None,
+        github_review_url: str | None,
+        github_user: str | None,
+        published_at: datetime | None,
+        error_code: str | None,
+        error_message: str | None,
+    ) -> GitHubReviewPublicationSnapshot:
+        if status not in {
+            GitHubPublicationStatus.PUBLISHED,
+            GitHubPublicationStatus.FAILED,
+            GitHubPublicationStatus.UNKNOWN,
+        }:
+            raise ValueError("publication final status is invalid")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE github_review_publications
+                SET status = ?, github_review_id = ?, github_review_url = ?,
+                    github_user = ?, published_at = ?, error_code = ?,
+                    error_message = ?
+                WHERE id = ? AND status = 'publishing'
+                """,
+                (
+                    status.value,
+                    github_review_id,
+                    github_review_url,
+                    github_user,
+                    published_at.isoformat() if published_at else None,
+                    error_code,
+                    error_message,
+                    publication_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("publication is not publishing")
+            row = connection.execute(
+                "SELECT * FROM github_review_publications WHERE id = ?",
+                (publication_id,),
+            ).fetchone()
+            return self._github_review_publication(row)
+
+    def update_review_diff_snapshot(
+        self,
+        *,
+        run_id: str,
+        status: ReviewSnapshotStatus,
+        summary: str,
+    ) -> ReviewDiffSnapshot:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE review_diff_snapshots
+                SET status = ?, summary = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (status.value, summary, now, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Review Diff 快照不存在：{run_id}")
+            row = connection.execute(
+                "SELECT * FROM review_diff_snapshots WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return self._review_diff_snapshot(row)
 
     def list_review_findings(
         self,
@@ -1393,6 +1982,14 @@ class SQLiteProjectThreadStore:
             task_kind=TaskKind(row["task_kind"]),
             status=RunStatus(row["status"]),
             error=row["error"],
+            network_access=bool(row["network_access"]),
+            network_provider=str(row["network_provider"]),
+            network_request_count=int(row["network_request_count"]),
+            network_result_count=int(row["network_result_count"]),
+            network_bytes_received=int(row["network_bytes_received"]),
+            network_cache_hit_count=int(row["network_cache_hit_count"]),
+            network_limit_reached=bool(row["network_limit_reached"]),
+            network_limit_reason=row["network_limit_reason"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
@@ -1451,13 +2048,81 @@ class SQLiteProjectThreadStore:
             file_path=row["file_path"],
             start_line=row["start_line"],
             end_line=row["end_line"],
+            line_side=(
+                ReviewLineSide(row["line_side"])
+                if row["line_side"] is not None
+                else None
+            ),
             title=str(row["title"]),
             description=str(row["description"]),
             suggestion=row["suggestion"],
             status=ReviewFindingStatus(row["status"]),
             fingerprint=str(row["fingerprint"]),
+            review_diff_hash=row["review_diff_hash"],
+            review_scope=(
+                ReviewScope(row["review_scope"])
+                if row["review_scope"] is not None
+                else None
+            ),
+            base_revision=row["base_revision"],
+            head_revision=row["head_revision"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _review_diff_snapshot(
+        row: sqlite3.Row | None,
+    ) -> ReviewDiffSnapshot:
+        if row is None:
+            raise RuntimeError("Review Diff 快照读取失败")
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise RuntimeError("Review Diff 快照格式无效")
+        return ReviewDiffSnapshot(
+            run_id=str(row["run_id"]),
+            status=ReviewSnapshotStatus(row["status"]),
+            diff=review_diff_from_dict(payload),
+            summary=str(row["summary"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _github_review_publication(
+        row: sqlite3.Row | None,
+    ) -> GitHubReviewPublicationSnapshot:
+        if row is None:
+            raise RuntimeError("GitHub Review publication 读取失败")
+        return GitHubReviewPublicationSnapshot(
+            id=str(row["id"]),
+            run_id=str(row["run_id"]),
+            repository=str(row["repository"]),
+            pr_number=int(row["pr_number"]),
+            base_sha=str(row["base_sha"]),
+            head_sha=str(row["head_sha"]),
+            event=GitHubReviewEvent(str(row["event"])),
+            selected_finding_ids=tuple(
+                str(value)
+                for value in json.loads(str(row["selected_finding_ids_json"]))
+            ),
+            finding_state_hash=str(row["finding_state_hash"]),
+            payload=dict(json.loads(str(row["payload_json"]))),
+            preview=dict(json.loads(str(row["preview_json"]))),
+            payload_hash=str(row["payload_hash"]),
+            status=GitHubPublicationStatus(str(row["status"])),
+            github_review_id=row["github_review_id"],
+            github_review_url=row["github_review_url"],
+            github_user=row["github_user"],
+            prepared_at=datetime.fromisoformat(str(row["prepared_at"])),
+            expires_at=datetime.fromisoformat(str(row["expires_at"])),
+            published_at=(
+                datetime.fromisoformat(str(row["published_at"]))
+                if row["published_at"] is not None
+                else None
+            ),
+            error_code=row["error_code"],
+            error_message=row["error_message"],
         )
 
     @staticmethod

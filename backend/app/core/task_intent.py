@@ -54,6 +54,10 @@ def classify_task_kind(prompt: str) -> TaskKind:
         "升级",
         "删除功能",
         "运行测试",
+        "推送代码",
+        "推送到",
+        "git push",
+        "push 代码",
     )
 
     analysis_keywords = (

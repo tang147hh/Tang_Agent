@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from app.backends.command_runner import (
@@ -17,6 +19,8 @@ GITHUB_OWNER_PATTERN = re.compile(
 )
 GITHUB_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 PROTECTED_BRANCHES = frozenset({"main", "master"})
+MAX_DIFF_FILES = 500
+MAX_UNTRACKED_TEXT_BYTES = 1_000_000
 SENSITIVE_FILE_NAMES = frozenset(
     {
         ".env",
@@ -71,6 +75,33 @@ class RepositoryCommitResult:
 class RepositoryPushResult:
     repository: RepositorySnapshot
     branch: str
+
+
+class FileChangeStatus(StrEnum):
+    MODIFIED = "modified"
+    ADDED = "added"
+    DELETED = "deleted"
+    UNTRACKED = "untracked"
+
+
+@dataclass(frozen=True, slots=True)
+class FileChangeSnapshot:
+    path: str
+    additions: int | None
+    deletions: int | None
+    binary: bool
+    status: FileChangeStatus
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectFileChangesSnapshot:
+    project_path: str
+    changed_files: int
+    additions: int
+    deletions: int
+    binary_files: int
+    hidden_files: int
+    files: tuple[FileChangeSnapshot, ...]
 
 
 def _sanitize_remote_url(value: str) -> str:
@@ -408,6 +439,215 @@ class RepositoryCatalog:
             ),
         )
         return self._snapshot(name, virtual_path)
+
+    def file_changes(self, name: str) -> ProjectFileChangesSnapshot:
+        """读取当前工作区相对 HEAD 的安全文件级增删统计。"""
+
+        virtual_path = self._repository_path(name)
+        status_result = self._run(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+            ],
+            cwd=virtual_path,
+            error=RepositoryConflictError("无法读取 Git 工作区改动"),
+        )
+        if status_result.truncated:
+            raise RepositoryConflictError("工作区改动过多，无法安全展示")
+
+        statuses = self._parse_change_statuses(status_result.stdout)
+        has_head = self._run_optional(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=virtual_path,
+        ) is not None
+        changes: dict[str, FileChangeSnapshot] = {}
+        hidden_paths: set[str] = set()
+
+        if has_head:
+            diff_result = self._run(
+                [
+                    "git",
+                    "diff",
+                    "--numstat",
+                    "-z",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "HEAD",
+                    "--",
+                ],
+                cwd=virtual_path,
+                error=RepositoryConflictError(
+                    "无法统计 Git 工作区改动"
+                ),
+            )
+            if diff_result.truncated:
+                raise RepositoryConflictError(
+                    "工作区改动过多，无法安全展示"
+                )
+            for relative_path, additions, deletions in (
+                self._parse_numstat(diff_result.stdout)
+            ):
+                if self._is_sensitive_path(relative_path):
+                    hidden_paths.add(relative_path)
+                    continue
+                canonical_path, real_path = self._safe_change_path(
+                    virtual_path,
+                    relative_path,
+                )
+                del real_path
+                binary = additions is None or deletions is None
+                changes[relative_path] = FileChangeSnapshot(
+                    path=canonical_path,
+                    additions=additions,
+                    deletions=deletions,
+                    binary=binary,
+                    status=statuses.get(
+                        relative_path,
+                        FileChangeStatus.MODIFIED,
+                    ),
+                )
+
+        for relative_path, change_status in statuses.items():
+            if relative_path in changes or relative_path in hidden_paths:
+                continue
+            if self._is_sensitive_path(relative_path):
+                hidden_paths.add(relative_path)
+                continue
+
+            canonical_path, real_path = self._safe_change_path(
+                virtual_path,
+                relative_path,
+            )
+            if change_status is FileChangeStatus.DELETED:
+                additions, deletions, binary = 0, 0, False
+            else:
+                additions, binary = self._untracked_line_count(real_path)
+                deletions = 0 if additions is not None else None
+            changes[relative_path] = FileChangeSnapshot(
+                path=canonical_path,
+                additions=additions,
+                deletions=deletions,
+                binary=binary,
+                status=change_status,
+            )
+
+        if len(changes) > MAX_DIFF_FILES:
+            raise RepositoryConflictError(
+                f"工作区改动超过 {MAX_DIFF_FILES} 个文件，无法安全展示"
+            )
+
+        files = tuple(
+            sorted(changes.values(), key=lambda item: item.path.casefold())
+        )
+        return ProjectFileChangesSnapshot(
+            project_path=virtual_path,
+            changed_files=len(files),
+            additions=sum(item.additions or 0 for item in files),
+            deletions=sum(item.deletions or 0 for item in files),
+            binary_files=sum(item.binary for item in files),
+            hidden_files=len(hidden_paths),
+            files=files,
+        )
+
+    @staticmethod
+    def _parse_change_statuses(
+        output: str,
+    ) -> dict[str, FileChangeStatus]:
+        statuses: dict[str, FileChangeStatus] = {}
+        for item in output.split("\0"):
+            if not item:
+                continue
+            if len(item) < 4 or item[2] != " ":
+                raise RepositoryConflictError(
+                    "Git 返回了无法解析的工作区状态"
+                )
+            code = item[:2]
+            relative_path = item[3:]
+            if not relative_path:
+                continue
+            if code == "??":
+                status = FileChangeStatus.UNTRACKED
+            elif "D" in code:
+                status = FileChangeStatus.DELETED
+            elif "A" in code:
+                status = FileChangeStatus.ADDED
+            else:
+                status = FileChangeStatus.MODIFIED
+            statuses[relative_path] = status
+        return statuses
+
+    @staticmethod
+    def _parse_numstat(
+        output: str,
+    ) -> tuple[tuple[str, int | None, int | None], ...]:
+        rows: list[tuple[str, int | None, int | None]] = []
+        for item in output.split("\0"):
+            if not item:
+                continue
+            fields = item.split("\t", maxsplit=2)
+            if len(fields) != 3 or not fields[2]:
+                raise RepositoryConflictError(
+                    "Git 返回了无法解析的文件改动统计"
+                )
+            try:
+                additions = None if fields[0] == "-" else int(fields[0])
+                deletions = None if fields[1] == "-" else int(fields[1])
+            except ValueError as exc:
+                raise RepositoryConflictError(
+                    "Git 返回了无法解析的行数统计"
+                ) from exc
+            rows.append((fields[2], additions, deletions))
+        return tuple(rows)
+
+    def _safe_change_path(
+        self,
+        project_virtual_path: str,
+        relative_path: str,
+    ) -> tuple[str, Path]:
+        if (
+            not relative_path
+            or relative_path.startswith(("/", "~"))
+            or "\\" in relative_path
+            or "\x00" in relative_path
+        ):
+            raise RepositoryValidationError("Git 文件路径不合法")
+        try:
+            project_path = self.workspace.resolve(project_virtual_path)
+            real_path = self.workspace.resolve(
+                f"{project_virtual_path}/{relative_path}"
+            )
+            if not real_path.is_relative_to(project_path):
+                raise WorkspacePathError("文件不属于当前项目")
+            return self.workspace.to_virtual(real_path), real_path
+        except WorkspacePathError as exc:
+            raise RepositoryValidationError(
+                "Git 文件路径越过项目边界"
+            ) from exc
+
+    @staticmethod
+    def _untracked_line_count(
+        real_path: Path,
+    ) -> tuple[int | None, bool]:
+        try:
+            if not real_path.is_file():
+                return None, True
+            if real_path.stat().st_size > MAX_UNTRACKED_TEXT_BYTES:
+                return None, True
+            raw = real_path.read_bytes()
+        except OSError:
+            return None, True
+        if b"\x00" in raw:
+            return None, True
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, True
+        return len(text.splitlines()), False
 
     def _repository_path(self, name: str) -> str:
         normalized_name = name.strip()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Sequence
@@ -36,6 +37,8 @@ SAFE_ENVIRONMENT_KEYS = {
 
 MAX_TIMEOUT_SECONDS = 600
 MAX_OUTPUT_CHARS = 50_000
+
+_SAFE_PUSH_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 
 SENSITIVE_ARGUMENT_MARKERS = (
     "token=",
@@ -281,6 +284,17 @@ class CommandRunner:
         if command != "git":
             return
 
+        if (
+            len(argv) > 1
+            and (
+                argv[1].lower() == "-c"
+                or argv[1].lower().startswith("--config-env")
+            )
+        ):
+            raise CommandPolicyError(
+                "禁止通过临时 Git 配置或别名执行命令"
+            )
+
         if "clean" in arguments:
             raise CommandPolicyError("禁止执行 git clean")
 
@@ -289,11 +303,8 @@ class CommandRunner:
                 "禁止执行 git reset --hard"
             )
 
-        if "push" in arguments and any(
-            argument in {"--force", "--force-with-lease", "-f"}
-            for argument in arguments
-        ):
-            raise CommandPolicyError("禁止强制推送")
+        if "push" in arguments:
+            self._validate_git_push_policy(argv)
 
         if "config" in arguments and any(
             argument in {"--global", "--system"}
@@ -301,6 +312,33 @@ class CommandRunner:
         ):
             raise CommandPolicyError(
                 "禁止修改全局或系统 Git 配置"
+            )
+
+    @staticmethod
+    def _validate_git_push_policy(argv: list[str]) -> None:
+        if (
+            argv[:4] != ["git", "push", "--set-upstream", "origin"]
+            or len(argv) != 5
+        ):
+            raise CommandPolicyError(
+                "Git push 只允许固定格式："
+                "git push --set-upstream origin <当前功能分支>"
+            )
+
+        branch = argv[4]
+        branch_parts = branch.split("/")
+        if (
+            branch.casefold() in {"main", "master"}
+            or branch == "@"
+            or not _SAFE_PUSH_BRANCH.fullmatch(branch)
+            or ".." in branch
+            or "//" in branch
+            or "@{" in branch
+            or branch.endswith(("/", ".", ".lock"))
+            or any(part.startswith(".") for part in branch_parts)
+        ):
+            raise CommandPolicyError(
+                "Git push 只允许安全的非受保护功能分支"
             )
 
     def _validate_github_cli_policy(
@@ -360,6 +398,7 @@ class CommandRunner:
         environment["PYTHONUTF8"] = "1"
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GIT_OPTIONAL_LOCKS"] = "0"
         environment["GH_PROMPT_DISABLED"] = "1"
         environment["GH_NO_UPDATE_NOTIFIER"] = "1"
 

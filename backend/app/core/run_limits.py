@@ -33,11 +33,29 @@ class RunBudget:
     max_identical_tool_calls: int = 2
 
 
+@dataclass(frozen=True, slots=True)
+class NetworkBudget:
+    max_searches: int
+    max_results_per_search: int
+    request_timeout_seconds: float
+    max_result_chars_per_search: int
+    max_total_result_chars: int
+    max_bytes_received: int
+
+
 DEFAULT_RUN_BUDGETS: dict[TaskKind, RunBudget] = {
     TaskKind.QA: RunBudget(3, 4, 12.0, 45.0),
     TaskKind.PLANNING: RunBudget(5, 10, 20.0, 120.0),
     TaskKind.ANALYSIS: RunBudget(8, 20, 25.0, 180.0),
     TaskKind.CODING: RunBudget(16, 40, 30.0, 480.0),
+}
+
+
+DEFAULT_NETWORK_BUDGETS: dict[TaskKind, NetworkBudget] = {
+    TaskKind.QA: NetworkBudget(2, 5, 15.0, 6_000, 12_000, 1_048_576),
+    TaskKind.PLANNING: NetworkBudget(3, 5, 15.0, 8_000, 20_000, 2_097_152),
+    TaskKind.ANALYSIS: NetworkBudget(4, 5, 15.0, 8_000, 24_000, 2_097_152),
+    TaskKind.CODING: NetworkBudget(4, 5, 15.0, 8_000, 24_000, 2_097_152),
 }
 
 
@@ -80,6 +98,39 @@ def budget_for(task_kind: TaskKind) -> RunBudget:
         max_identical_tool_calls=_positive_int(
             f"{prefix}MAX_IDENTICAL_TOOL_CALLS",
             default.max_identical_tool_calls,
+        ),
+    )
+
+
+def network_budget_for(task_kind: TaskKind) -> NetworkBudget:
+    """读取集中配置的 Run 级网络子预算。"""
+
+    default = DEFAULT_NETWORK_BUDGETS[task_kind]
+    prefix = f"TANG_AGENT_{task_kind.value.upper()}_NETWORK_"
+    return NetworkBudget(
+        max_searches=_positive_int(
+            f"{prefix}MAX_SEARCHES",
+            default.max_searches,
+        ),
+        max_results_per_search=_positive_int(
+            f"{prefix}MAX_RESULTS_PER_SEARCH",
+            default.max_results_per_search,
+        ),
+        request_timeout_seconds=_positive_float(
+            f"{prefix}REQUEST_TIMEOUT_SECONDS",
+            default.request_timeout_seconds,
+        ),
+        max_result_chars_per_search=_positive_int(
+            f"{prefix}MAX_RESULT_CHARS_PER_SEARCH",
+            default.max_result_chars_per_search,
+        ),
+        max_total_result_chars=_positive_int(
+            f"{prefix}MAX_TOTAL_RESULT_CHARS",
+            default.max_total_result_chars,
+        ),
+        max_bytes_received=_positive_int(
+            f"{prefix}MAX_BYTES_RECEIVED",
+            default.max_bytes_received,
         ),
     )
 

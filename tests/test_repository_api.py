@@ -97,6 +97,75 @@ def test_repository_list_branch_and_checkout_api(
     assert str(workspace.root) not in listed.text
 
 
+def test_project_file_changes_api_returns_virtual_paths(
+    tmp_path: Path,
+) -> None:
+    app, workspace = _test_app(tmp_path)
+    _initialize_repository(workspace)
+    target = workspace.resolve("/projects/demo")
+    target.joinpath("README.md").write_text(
+        "# Demo\nAPI change\n",
+        encoding="utf-8",
+    )
+    target.joinpath("new.py").write_text(
+        "print('safe')\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/api/projects",
+            json={
+                "name": "Demo",
+                "virtual_path": "/projects/demo",
+            },
+        ).json()
+        response = client.get(
+            f"/api/projects/{project['project_id']}/file-changes"
+        )
+        missing = client.get(
+            "/api/projects/missing-project/file-changes"
+        )
+
+    assert response.status_code == 200
+    assert response.json()["changed_files"] == 2
+    assert response.json()["additions"] == 2
+    assert response.json()["deletions"] == 0
+    assert [item["path"] for item in response.json()["files"]] == [
+        "/projects/demo/new.py",
+        "/projects/demo/README.md",
+    ]
+    assert str(workspace.root) not in response.text
+    assert missing.status_code == 404
+
+
+def test_project_file_changes_api_identifies_non_git_project(
+    tmp_path: Path,
+) -> None:
+    app, workspace = _test_app(tmp_path)
+    workspace.resolve("/projects/demo").mkdir()
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/api/projects",
+            json={
+                "name": "Demo",
+                "virtual_path": "/projects/demo",
+            },
+        ).json()
+        response = client.get(
+            f"/api/projects/{project['project_id']}/file-changes"
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {
+            "code": "repository_not_found",
+            "message": "当前项目不是 Git 仓库",
+        }
+    }
+
+
 def test_clone_and_fetch_api_status_codes(
     tmp_path: Path,
     monkeypatch,

@@ -1,4 +1,7 @@
 from app.repositories.catalog import (
+    FileChangeSnapshot,
+    FileChangeStatus,
+    ProjectFileChangesSnapshot,
     RepositoryCatalog,
     RepositoryCommitResult,
     RepositoryConflictError,
@@ -19,6 +22,9 @@ from app.repositories.github import (
 )
 
 __all__ = [
+    "FileChangeSnapshot",
+    "FileChangeStatus",
+    "ProjectFileChangesSnapshot",
     "RepositoryCatalog",
     "RepositoryCommitResult",
     "RepositoryConflictError",

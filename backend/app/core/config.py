@@ -35,6 +35,60 @@ class Settings:
     model_max_tokens: int
     model_timeout: float
     model_max_retries: int
+    review_diff_max_files: int = 50
+    review_diff_max_file_patch_chars: int = 40_000
+    review_diff_max_file_changed_lines: int = 800
+    review_diff_max_total_patch_chars: int = 200_000
+    review_diff_max_total_changed_lines: int = 3_000
+    review_git_timeout: float = 30.0
+    github_review_publish_enabled: bool = False
+    github_cli_timeout: float = 20.0
+    github_publication_ttl_seconds: int = 900
+    github_review_max_inline_comments: int = 50
+    github_review_max_comment_chars: int = 8_000
+    github_review_max_summary_chars: int = 20_000
+    web_search_provider: str = "disabled"
+    zhipu_api_key: str = field(default="", repr=False)
+    web_search_cache_ttl_seconds: int = 600
+    web_search_empty_cache_ttl_seconds: int = 60
+    web_search_cache_max_entries: int = 128
+
+    def __post_init__(self) -> None:
+        positive = (
+            "review_diff_max_files",
+            "review_diff_max_file_patch_chars",
+            "review_diff_max_file_changed_lines",
+            "review_diff_max_total_patch_chars",
+            "review_diff_max_total_changed_lines",
+            "review_git_timeout",
+            "github_cli_timeout",
+            "github_publication_ttl_seconds",
+            "github_review_max_inline_comments",
+            "github_review_max_comment_chars",
+            "github_review_max_summary_chars",
+            "web_search_cache_ttl_seconds",
+            "web_search_empty_cache_ttl_seconds",
+            "web_search_cache_max_entries",
+        )
+        for name in positive:
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} 必须大于 0")
+        if self.web_search_provider not in {"disabled", "zhipu"}:
+            raise ValueError(
+                "web_search_provider 只允许 disabled 或 zhipu"
+            )
+
+
+def _boolean_environment(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} 必须是 true 或 false")
 
 
 def load_settings() -> Settings:
@@ -91,5 +145,67 @@ def load_settings() -> Settings:
         ),
         model_max_retries=int(
             os.getenv("TANG_AGENT_MODEL_MAX_RETRIES", "2")
+        ),
+        review_diff_max_files=int(
+            os.getenv("TANG_AGENT_REVIEW_DIFF_MAX_FILES", "50")
+        ),
+        review_diff_max_file_patch_chars=int(
+            os.getenv(
+                "TANG_AGENT_REVIEW_DIFF_MAX_FILE_PATCH_CHARS",
+                "40000",
+            )
+        ),
+        review_diff_max_file_changed_lines=int(
+            os.getenv(
+                "TANG_AGENT_REVIEW_DIFF_MAX_FILE_CHANGED_LINES",
+                "800",
+            )
+        ),
+        review_diff_max_total_patch_chars=int(
+            os.getenv(
+                "TANG_AGENT_REVIEW_DIFF_MAX_TOTAL_PATCH_CHARS",
+                "200000",
+            )
+        ),
+        review_diff_max_total_changed_lines=int(
+            os.getenv(
+                "TANG_AGENT_REVIEW_DIFF_MAX_TOTAL_CHANGED_LINES",
+                "3000",
+            )
+        ),
+        review_git_timeout=float(
+            os.getenv("TANG_AGENT_REVIEW_GIT_TIMEOUT", "30")
+        ),
+        github_review_publish_enabled=_boolean_environment(
+            "TANG_AGENT_GITHUB_REVIEW_PUBLISH_ENABLED",
+        ),
+        github_cli_timeout=float(
+            os.getenv("TANG_AGENT_GITHUB_CLI_TIMEOUT", "20")
+        ),
+        github_publication_ttl_seconds=int(
+            os.getenv("TANG_AGENT_GITHUB_PUBLICATION_TTL_SECONDS", "900")
+        ),
+        github_review_max_inline_comments=int(
+            os.getenv("TANG_AGENT_GITHUB_REVIEW_MAX_INLINE_COMMENTS", "50")
+        ),
+        github_review_max_comment_chars=int(
+            os.getenv("TANG_AGENT_GITHUB_REVIEW_MAX_COMMENT_CHARS", "8000")
+        ),
+        github_review_max_summary_chars=int(
+            os.getenv("TANG_AGENT_GITHUB_REVIEW_MAX_SUMMARY_CHARS", "20000")
+        ),
+        web_search_provider=os.getenv(
+            "TANG_AGENT_WEB_SEARCH_PROVIDER",
+            "disabled",
+        ).strip().lower(),
+        zhipu_api_key=os.getenv("ZHIPU_API_KEY", "").strip(),
+        web_search_cache_ttl_seconds=int(
+            os.getenv("TANG_AGENT_WEB_SEARCH_CACHE_TTL_SECONDS", "600")
+        ),
+        web_search_empty_cache_ttl_seconds=int(
+            os.getenv("TANG_AGENT_WEB_SEARCH_EMPTY_CACHE_TTL_SECONDS", "60")
+        ),
+        web_search_cache_max_entries=int(
+            os.getenv("TANG_AGENT_WEB_SEARCH_CACHE_MAX_ENTRIES", "128")
         ),
     )

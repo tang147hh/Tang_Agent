@@ -220,6 +220,69 @@ class RecoverableRejectionConversationAgent:
         }
 
 
+class WorkspaceSearchConversationAgent:
+    def stream(self, *args, **kwargs):
+        del args, kwargs
+        yield {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "workspace_search",
+                            "args": {
+                                "path": "/projects/demo",
+                                "query": "SECRET_LOCAL_CODE",
+                                "file_pattern": "**/*.py",
+                                "max_results": 20,
+                            },
+                            "id": "workspace-search-1",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                {},
+            ),
+        }
+        yield {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                ToolMessage(
+                    content=json.dumps(
+                        {
+                            "ok": True,
+                            "query": "SECRET_LOCAL_CODE",
+                            "matches": [
+                                {
+                                    "path": "/projects/demo/app.py",
+                                    "line_number": 8,
+                                    "snippet": "SECRET_LOCAL_CODE = True",
+                                }
+                            ],
+                            "match_count": 1,
+                            "files_searched": 4,
+                            "skipped_file_count": 1,
+                            "scanned_bytes": 2048,
+                            "truncated": False,
+                            "duration_ms": 3.5,
+                        }
+                    ),
+                    tool_call_id="workspace-search-1",
+                    name="workspace_search",
+                ),
+                {},
+            ),
+        }
+        yield {
+            "type": "messages",
+            "ns": (),
+            "data": (AIMessageChunk(content="定位完成"), {}),
+        }
+
+
 def _conversation_app(
     tmp_path: Path,
     *,
@@ -267,6 +330,57 @@ def _conversation_app(
     )
 
     return app, thread, run
+
+
+def test_workspace_search_events_are_structured_and_counted(
+    tmp_path: Path,
+) -> None:
+    app, thread, _ = _conversation_app(
+        tmp_path,
+        agent_factory=lambda task_kind: WorkspaceSearchConversationAgent(),
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={"content": "定位代码", "task_kind": "analysis"},
+        )
+        run_id = created.json()["run"]["run_id"]
+        response = client.get(f"/api/runs/{run_id}/events")
+        performance = client.get(
+            f"/api/runs/{run_id}/performance"
+        ).json()
+
+    event_payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    started = next(
+        payload
+        for payload in event_payloads
+        if payload.get("name") == "workspace_search"
+        and "file_pattern" in payload
+    )
+    finished = next(
+        payload
+        for payload in event_payloads
+        if payload.get("name") == "workspace_search"
+        and "match_count" in payload
+    )
+
+    assert started["path"] == "/projects/demo"
+    assert started["file_pattern"] == "**/*.py"
+    assert started["max_results"] == 20
+    assert "query" not in started
+    assert finished["match_count"] == 1
+    assert finished["files_searched"] == 4
+    assert finished["skipped_file_count"] == 1
+    assert finished["scanned_bytes"] == 2048
+    assert finished["duration_ms"] == 3.5
+    assert performance["tool_calls"] == 1
+    assert "SECRET_LOCAL_CODE" not in response.text
+    assert "snippet" not in response.text
 
 
 def test_reads_thread_messages_and_runs(

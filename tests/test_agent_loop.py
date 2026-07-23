@@ -46,6 +46,8 @@ def backend(tmp_path: Path) -> LocalShellBackend:
             TaskKind.ANALYSIS,
             {
                 "workspace_list",
+                "workspace_glob",
+                "workspace_search",
                 "workspace_read",
             },
         ),
@@ -53,6 +55,8 @@ def backend(tmp_path: Path) -> LocalShellBackend:
             TaskKind.CODING,
             {
                 "workspace_list",
+                "workspace_glob",
+                "workspace_search",
                 "workspace_read",
                 "workspace_write",
                 "workspace_edit",
@@ -301,6 +305,49 @@ def test_deep_agent_recovers_from_missing_file_error(
     )
 
 
+def test_workspace_glob_host_path_is_a_recoverable_safety_rejection(
+    backend: LocalShellBackend,
+) -> None:
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_glob",
+                        "args": {
+                            "path": "/Users/tang/private",
+                            "pattern": "**/*.py",
+                        },
+                        "id": "unsafe-glob",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="已拒绝工作区外路径"),
+        ]
+    )
+
+    result = build_agent(
+        TaskKind.ANALYSIS,
+        backend=backend,
+        model=model,
+    ).invoke(
+        {"messages": [{"role": "user", "content": "搜索主机路径"}]}
+    )
+    tool_message = next(
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage)
+    )
+
+    assert tool_message.status == "error"
+    assert '"status": "rejected"' in str(tool_message.content)
+    assert '"error_type": "WorkspacePathError"' in str(
+        tool_message.content
+    )
+
+
 def test_deep_agent_completes_tool_loop(
     backend: LocalShellBackend,
 ) -> None:
@@ -359,6 +406,142 @@ def test_deep_agent_completes_tool_loop(
         and "hello from Tang Agent" in str(message.content)
         for message in result["messages"]
     )
+
+
+def test_agent_searches_once_before_reading_the_located_file(
+    backend: LocalShellBackend,
+) -> None:
+    backend.write_text(
+        "/projects/demo/app/service.py",
+        "def locate_me():\n    return 'found'\n",
+    )
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_search",
+                        "args": {
+                            "path": "/projects/demo",
+                            "query": "locate_me",
+                            "file_pattern": "**/*.py",
+                        },
+                        "id": "call_search",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_read",
+                        "args": {
+                            "path": "/projects/demo/app/service.py",
+                            "offset": 0,
+                            "limit": 20,
+                        },
+                        "id": "call_read_located",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="已通过一次搜索定位并读取 service.py"),
+        ]
+    )
+
+    result = build_agent(
+        TaskKind.ANALYSIS,
+        backend=backend,
+        model=model,
+    ).invoke(
+        {"messages": [{"role": "user", "content": "定位 locate_me"}]}
+    )
+
+    tool_messages = [
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage)
+    ]
+    assert len(tool_messages) == 2
+    assert '"line_number": 1' in str(tool_messages[0].content)
+    assert "return 'found'" in str(tool_messages[1].content)
+
+
+def test_workspace_search_calls_use_existing_repeat_guard(
+    backend: LocalShellBackend,
+) -> None:
+    call = {
+        "name": "workspace_search",
+        "args": {
+            "path": "/projects",
+            "query": "same query",
+        },
+        "type": "tool_call",
+    }
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(content="", tool_calls=[{**call, "id": "search-1"}]),
+            AIMessage(content="", tool_calls=[{**call, "id": "search-2"}]),
+            AIMessage(content="", tool_calls=[{**call, "id": "search-3"}]),
+        ]
+    )
+
+    with pytest.raises(RunLimitExceeded) as error:
+        build_agent(
+            TaskKind.ANALYSIS,
+            backend=backend,
+            model=model,
+        ).invoke(
+            {"messages": [{"role": "user", "content": "重复搜索"}]}
+        )
+
+    assert error.value.reason is RunTerminationReason.REPEATED_TOOL_CALL
+
+
+def test_workspace_search_calls_use_existing_tool_budget(
+    backend: LocalShellBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TANG_AGENT_QA_MAX_TOOL_CALLS", "1")
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_glob",
+                        "args": {"path": "/projects", "pattern": "**/*.py"},
+                        "id": "glob-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_search",
+                        "args": {"path": "/projects", "query": "different"},
+                        "id": "search-2",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        ]
+    )
+
+    with pytest.raises(RunLimitExceeded) as error:
+        build_agent(
+            TaskKind.QA,
+            backend=backend,
+            model=model,
+        ).invoke(
+            {"messages": [{"role": "user", "content": "查找代码"}]}
+        )
+
+    assert error.value.reason is RunTerminationReason.TOOL_CALL_LIMIT
 
 
 def test_model_budget_is_shared_with_subagent(

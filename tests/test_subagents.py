@@ -16,6 +16,8 @@ from app.core.subagents import (
     build_reviewer_subagent,
 )
 from app.core.task_intent import TaskKind
+from app.core.run_limits import network_budget_for
+from app.tools.web_search import FakeSearchProvider, SearchCache, SearchRuntime
 
 
 class ToolCallingFakeModel(FakeMessagesListChatModel):
@@ -51,6 +53,8 @@ def test_analysis_subagent_only_receives_read_tools(
     assert subagent["name"] == "general-purpose"
     assert tool_names == {
         "workspace_list",
+        "workspace_glob",
+        "workspace_search",
         "workspace_read",
     }
     assert "workspace_write" not in tool_names
@@ -70,10 +74,7 @@ def test_reviewer_subagent_is_read_only_and_requires_structured_output(
     subagent = build_reviewer_subagent(backend, model)
 
     assert subagent["name"] == "reviewer"
-    assert {tool.name for tool in subagent["tools"]} == {
-        "workspace_list",
-        "workspace_read",
-    }
+    assert subagent["tools"] == []
     assert "workspace_write" not in {
         tool.name for tool in subagent["tools"]
     }
@@ -81,7 +82,35 @@ def test_reviewer_subagent_is_read_only_and_requires_structured_output(
         tool.name for tool in subagent["tools"]
     }
     assert '"findings"' in subagent["system_prompt"]
-    assert "不得使用 workspace_write" in subagent["system_prompt"]
+    assert "不得使用 workspace_list" in subagent["system_prompt"]
+
+
+def test_analysis_subagent_shares_network_runtime_but_reviewer_never_does(
+    backend: LocalShellBackend,
+) -> None:
+    model = ToolCallingFakeModel(responses=[AIMessage(content="done")])
+    runtime = SearchRuntime(
+        task_kind=TaskKind.CODING,
+        network_access=True,
+        provider=FakeSearchProvider(),
+        budget=network_budget_for(TaskKind.CODING),
+        cache=SearchCache(),
+    )
+    analysis = build_analysis_subagent(
+        backend,
+        model,
+        search_runtime=runtime,
+    )
+    reviewer = build_reviewer_subagent(backend, model)
+
+    assert {tool.name for tool in analysis["tools"]} == {
+        "workspace_list",
+        "workspace_glob",
+        "workspace_search",
+        "workspace_read",
+        "web_search",
+    }
+    assert reviewer["tools"] == []
 
 
 def test_main_agent_can_delegate_read_only_analysis(

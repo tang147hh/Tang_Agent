@@ -43,3 +43,33 @@ def test_logging_creates_log_file(tmp_path: Path) -> None:
 
     assert log_path.exists()
     assert "foundation test" in log_path.read_text(encoding="utf-8")
+
+
+def test_logging_redacts_host_paths_credentials_and_tracebacks(
+    tmp_path: Path,
+) -> None:
+    settings = replace(
+        load_settings(),
+        log_dir=tmp_path / "logs",
+    )
+    log_path = configure_logging(settings)
+    credential = "ghp_" + "a" * 36
+
+    try:
+        raise RuntimeError(
+            f"token={credential} project={PROJECT_ROOT}"
+        )
+    except RuntimeError:
+        logging.getLogger("tests.foundation").exception(
+            "provider failure in %s",
+            PROJECT_ROOT,
+        )
+
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    content = log_path.read_text(encoding="utf-8")
+    assert "Traceback" in content
+    assert "[REDACTED]" in content
+    assert credential not in content
+    assert str(Path.home()) not in content

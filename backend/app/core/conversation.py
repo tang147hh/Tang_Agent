@@ -77,6 +77,14 @@ class RunSnapshot:
     task_kind: TaskKind
     status: RunStatus
     error: str | None
+    network_access: bool
+    network_provider: str
+    network_request_count: int
+    network_result_count: int
+    network_bytes_received: int
+    network_cache_hit_count: int
+    network_limit_reached: bool
+    network_limit_reason: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -163,6 +171,8 @@ class ConversationStore(
         *,
         thread_id: str,
         task_kind: TaskKind = TaskKind.QA,
+        network_access: bool = False,
+        network_provider: str = "disabled",
     ) -> RunSnapshot: ...
 
     def start_run_with_message(
@@ -171,6 +181,8 @@ class ConversationStore(
         thread_id: str,
         content: str,
         task_kind: TaskKind = TaskKind.QA,
+        network_access: bool = False,
+        network_provider: str = "disabled",
     ) -> tuple[RunSnapshot, MessageSnapshot]:
         """原子创建 Run 和对应的用户消息。"""
         ...
@@ -239,6 +251,18 @@ class ConversationStore(
         self,
         run_id: str,
     ) -> RunPerformanceSnapshot | None: ...
+
+    def update_run_network_metrics(
+        self,
+        *,
+        run_id: str,
+        request_count: int,
+        result_count: int,
+        bytes_received: int,
+        cache_hit_count: int,
+        limit_reached: bool,
+        limit_reason: str | None,
+    ) -> RunSnapshot: ...
 
     def add_review_findings(
         self,

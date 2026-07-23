@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
+import { Globe2, ScanSearch } from 'lucide-react'
 import {
   checkoutRepositoryBranch,
   cloneRepository,
   commitRepository,
   createProject,
+  createCodeReviewRun,
   createRepositoryBranch,
   createRepositoryPullRequest,
   createThread,
   fetchRepository,
   getRun,
   getRunPerformance,
+  getToolCapabilities,
+  getProjectFileChanges,
   getSkill,
   getThread,
   listMessages,
@@ -23,10 +27,12 @@ import {
   runEventKinds,
   runEventsUrl,
   startRun,
+  startCodeReview,
 } from './api'
 import type {
   Message,
   Project,
+  ProjectFileChanges,
   PullRequest,
   Repository,
   Run,
@@ -37,11 +43,17 @@ import type {
   SkillSummary,
   TaskKind,
   Thread,
+  ToolCapabilities,
+  ReviewScope,
+  ReviewSource,
 } from './api'
 import { MarkdownContent } from './MarkdownContent'
+import { ReviewWorkspace } from './review/ReviewWorkspace'
+import { durationLabel, stepPresentation } from './stepPresentation'
+import { acceptRunEvent, reconcileRunStream } from './streamUtils'
 import './App.css'
 
-type View = 'chat' | 'skills' | 'repositories'
+type View = 'chat' | 'skills' | 'repositories' | 'review'
 type IconName =
   | 'arrow-left'
   | 'book'
@@ -77,6 +89,7 @@ interface AgentStep {
   createdAt: string
   source: string
   toolCallId?: string
+  sources?: Array<{ citation_id: string; title: string; url: string }>
 }
 
 type PendingRepositoryAction =
@@ -97,17 +110,6 @@ const taskKinds: Array<{ value: TaskKind; icon: IconName }> = [
   { value: 'planning', icon: 'message' },
   { value: 'qa', icon: 'question' },
 ]
-
-const stepCopy: Record<RunEventKind, { title: string; detail: string }> = {
-  created: { title: '任务已创建', detail: '已接收用户请求并创建执行记录' },
-  running: { title: '分析项目', detail: '正在读取上下文并执行任务' },
-  token: { title: '生成回答', detail: '正在整理结果并生成回复' },
-  tool_started: { title: '调用工具', detail: '正在执行项目工具' },
-  tool_finished: { title: '工具执行完成', detail: '工具结果已返回 Agent' },
-  completed: { title: '完成', detail: '任务执行完成，等待下一条指令' },
-  failed: { title: '执行失败', detail: '任务未能完成，请查看错误信息' },
-  terminated: { title: '预算已终止', detail: 'Run 已达到执行预算并安全结束' },
-}
 
 const implementPlanPrompt = '请按照上面的方案开始实施，并在完成后运行相关测试。'
 
@@ -168,12 +170,6 @@ function timeLabel(value: string): string {
   return new Date(value).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
-function durationLabel(value: number | null | undefined): string {
-  if (value === null || value === undefined) return '—'
-  if (value < 1000) return `${Math.round(value)} ms`
-  return `${(value / 1000).toFixed(1)} s`
-}
-
 const terminationLabels: Record<string, string> = {
   model_call_limit: '模型调用预算',
   tool_call_limit: '工具调用预算',
@@ -192,46 +188,15 @@ function stepIdentity(kind: RunEventKind, payload: RunEventPayload, eventId: str
   return eventId || `${kind}-${payload.created_at}`
 }
 
-function stepPresentation(kind: RunEventKind, payload: RunEventPayload) {
-  const copy = stepCopy[kind]
-  const isSubagent = payload.source.startsWith('subagent')
-  const subagent = payload.subagent ?? 'general-purpose'
-
-  if (kind === 'token' && isSubagent) {
-    return {
-      title: '子 Agent 分析',
-      detail: `${subagent} 正在整理分析结果`,
-    }
-  }
-
-  if (kind === 'tool_started' || kind === 'tool_finished') {
-    const finished = kind === 'tool_finished'
-
-    if (payload.name === 'task') {
-      return {
-        title: '委派子 Agent',
-        detail: finished
-          ? `${subagent} 已返回分析结果`
-          : `正在调用 ${subagent}`,
-      }
-    }
-
-    const toolName = payload.name ?? '项目工具'
-    return {
-      title: isSubagent ? '子 Agent 调用工具' : copy.title,
-      detail: `${isSubagent ? `${subagent} · ` : ''}${toolName}${finished ? ' 已完成' : ''}`,
-    }
-  }
-
-  return {
-    title: copy.title,
-    detail: kind === 'failed' || kind === 'terminated'
-      ? payload.error ?? copy.detail
-      : copy.detail,
-  }
-}
-
-function RepositoriesPage({ search }: { search: string }) {
+function RepositoriesPage({
+  search,
+  projects,
+  onOpenReview,
+}: {
+  search: string
+  projects: Project[]
+  onOpenReview: (projectId: string) => void
+}) {
   const [repositories, setRepositories] = useState<Repository[]>([])
   const [selectedName, setSelectedName] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -275,6 +240,9 @@ function RepositoriesPage({ search }: { search: string }) {
   const selectedRepository = repositories.find(
     (repository) => repository.name === selectedName,
   ) ?? null
+  const registeredProject = selectedRepository
+    ? projects.find((project) => project.virtual_path === selectedRepository.path) ?? null
+    : null
   const filteredRepositories = useMemo(() => {
     const query = search.trim().toLocaleLowerCase()
 
@@ -524,9 +492,14 @@ function RepositoriesPage({ search }: { search: string }) {
                   <span className="repository-detail-icon"><Icon name="repository" size={20} /></span>
                   <div><h2>{selectedRepository.name}</h2><code>{selectedRepository.path}</code></div>
                 </div>
-                <button className="secondary-action" type="button" disabled={Boolean(busy)} onClick={() => void handleFetch()}>
-                  <Icon name="refresh" size={16} />{busy === 'fetch' ? '正在 Fetch…' : 'Fetch'}
-                </button>
+                <div className="repository-header-actions">
+                  <button className="primary-action repository-review-action" type="button" disabled={!registeredProject || Boolean(busy)} title={registeredProject ? '打开代码审查工作台' : '请先将该仓库登记为 Project'} onClick={() => registeredProject && onOpenReview(registeredProject.project_id)}>
+                    <ScanSearch size={16} />代码审查
+                  </button>
+                  <button className="secondary-action" type="button" disabled={Boolean(busy)} onClick={() => void handleFetch()}>
+                    <Icon name="refresh" size={16} />{busy === 'fetch' ? '正在 Fetch…' : 'Fetch'}
+                  </button>
+                </div>
               </header>
 
               <div className="repository-facts">
@@ -640,11 +613,18 @@ function App() {
   const [skillDetail, setSkillDetail] = useState<SkillDetail | null>(null)
   const [activeRun, setActiveRun] = useState<Run | null>(null)
   const [runPerformance, setRunPerformance] = useState<RunPerformance | null>(null)
-  const [streamText, setStreamText] = useState('')
+  const [fileChanges, setFileChanges] = useState<ProjectFileChanges | null>(null)
+  const [fileChangesError, setFileChangesError] = useState('')
+  const [loadingFileChanges, setLoadingFileChanges] = useState(false)
+  const [runStream, setRunStream] = useState({ runId: null as string | null, text: '' })
   const [steps, setSteps] = useState<AgentStep[]>([])
   const [prompt, setPrompt] = useState('')
   const [taskKind, setTaskKind] = useState<TaskKind>('coding')
   const [showTaskKindMenu, setShowTaskKindMenu] = useState(false)
+  const [networkAccess, setNetworkAccess] = useState(false)
+  const [showNetworkMenu, setShowNetworkMenu] = useState(false)
+  const [toolCapabilities, setToolCapabilities] = useState<ToolCapabilities | null>(null)
+  const [capabilityError, setCapabilityError] = useState('')
   const [search, setSearch] = useState('')
   const [notice, setNotice] = useState('准备就绪')
   const [loadingProjects, setLoadingProjects] = useState(true)
@@ -663,12 +643,16 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [showRunPanel, setShowRunPanel] = useState(() => window.innerWidth > 1100)
+  const [reviewRunId, setReviewRunId] = useState<string | null>(null)
+  const [reviewReturnView, setReviewReturnView] = useState<'chat' | 'repositories'>('repositories')
   const eventSourceRef = useRef<EventSource | null>(null)
   const terminalRef = useRef(false)
   const messageEndRef = useRef<HTMLDivElement | null>(null)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
   const taskKindMenuRef = useRef<HTMLDivElement | null>(null)
+  const networkMenuRef = useRef<HTMLDivElement | null>(null)
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null)
+  const fileChangesRequestRef = useRef(0)
 
   const selectedProject = projects.find((item) => item.project_id === selectedProjectId) ?? null
   const selectedThread = threads.find((item) => item.thread_id === selectedThreadId) ?? null
@@ -699,6 +683,7 @@ function App() {
     () => actionablePlanningRunId(runs),
     [runs],
   )
+  const streamText = runStream.text
 
   useEffect(() => {
     if (!showTaskKindMenu) return
@@ -721,6 +706,60 @@ function App() {
     }
   }, [showTaskKindMenu])
 
+  useEffect(() => {
+    if (!showNetworkMenu) return
+
+    function closeNetworkMenu(event: MouseEvent) {
+      if (!networkMenuRef.current?.contains(event.target as Node)) {
+        setShowNetworkMenu(false)
+      }
+    }
+
+    function closeNetworkMenuWithEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') setShowNetworkMenu(false)
+    }
+
+    document.addEventListener('mousedown', closeNetworkMenu)
+    document.addEventListener('keydown', closeNetworkMenuWithEscape)
+    return () => {
+      document.removeEventListener('mousedown', closeNetworkMenu)
+      document.removeEventListener('keydown', closeNetworkMenuWithEscape)
+    }
+  }, [showNetworkMenu])
+
+  useEffect(() => {
+    let active = true
+    setCapabilityError('')
+    void getToolCapabilities(taskKind, networkAccess)
+      .then((capabilities) => {
+        if (active) setToolCapabilities(capabilities)
+      })
+      .catch((error: unknown) => {
+        if (!active) return
+        setToolCapabilities(null)
+        setCapabilityError(error instanceof Error ? error.message : '无法读取联网能力')
+      })
+    return () => {
+      active = false
+    }
+  }, [networkAccess, taskKind])
+
+  const refreshFileChanges = useCallback(async (projectId: string) => {
+    const requestId = ++fileChangesRequestRef.current
+    setLoadingFileChanges(true)
+    setFileChangesError('')
+    try {
+      const summary = await getProjectFileChanges(projectId)
+      if (requestId === fileChangesRequestRef.current) setFileChanges(summary)
+    } catch (error) {
+      if (requestId !== fileChangesRequestRef.current) return
+      setFileChanges(null)
+      setFileChangesError(error instanceof Error ? error.message : '无法读取文件更改')
+    } finally {
+      if (requestId === fileChangesRequestRef.current) setLoadingFileChanges(false)
+    }
+  }, [])
+
   const refreshConversation = useCallback(async (threadId: string, runId?: string) => {
     const [latestThread, latestMessages, latestRuns, latestRun] = await Promise.all([
       getThread(threadId),
@@ -739,11 +778,13 @@ function App() {
       : null
     setThreads((current) => current.map((item) => item.thread_id === latestThread.thread_id ? latestThread : item))
     setMessages(latestMessages)
+    setRunStream((current) => reconcileRunStream(current, latestMessages, runId))
     setRuns(authoritativeRuns)
     setRunPerformance(latestPerformance)
+    if (selectedProjectId) void refreshFileChanges(selectedProjectId)
     const running = [...authoritativeRuns].reverse().find((run) => run.status === 'pending' || run.status === 'running') ?? null
     setActiveRun(running)
-  }, [])
+  }, [refreshFileChanges, selectedProjectId])
 
   const closeEventSource = useCallback(() => {
     eventSourceRef.current?.close()
@@ -775,6 +816,7 @@ function App() {
               detail: presentation.detail,
               status,
               createdAt: payload.created_at,
+              sources: payload.sources ?? step.sources,
             }
           : step)
       }
@@ -790,6 +832,7 @@ function App() {
           createdAt: payload.created_at,
           source: payload.source,
           toolCallId: payload.tool_call_id,
+          sources: payload.sources,
         },
       ]
     })
@@ -798,18 +841,24 @@ function App() {
   const connectToRun = useCallback((runId: string, threadId: string) => {
     closeEventSource()
     terminalRef.current = false
+    setRunStream((current) => current.runId === runId ? current : { runId, text: '' })
     const source = new EventSource(runEventsUrl(runId))
+    const processedEventIds = new Set<string>()
     eventSourceRef.current = source
 
     for (const kind of runEventKinds) {
       source.addEventListener(kind, (rawEvent) => {
+        if (source !== eventSourceRef.current || terminalRef.current) return
         const event = rawEvent as MessageEvent<string>
+        if (!acceptRunEvent(event.lastEventId, processedEventIds)) return
         try {
           const payload = JSON.parse(event.data) as RunEventPayload
           updateSteps(kind, payload, event.lastEventId)
 
           if (kind === 'token' && payload.source === 'main' && payload.text) {
-            setStreamText((current) => current + payload.text)
+            setRunStream((current) => current.runId === runId
+              ? { ...current, text: current.text + payload.text }
+              : current)
           }
 
           if (
@@ -837,9 +886,13 @@ function App() {
       })
     }
 
-    source.onopen = () => setNotice('已连接 Agent 事件流')
+    source.onopen = () => {
+      if (source === eventSourceRef.current) setNotice('已连接 Agent 事件流')
+    }
     source.onerror = () => {
-      if (!terminalRef.current) setNotice('事件流中断，正在自动重连')
+      if (source === eventSourceRef.current && !terminalRef.current) {
+        setNotice('事件流中断，正在自动重连')
+      }
     }
   }, [closeEventSource, refreshConversation, updateSteps])
 
@@ -907,6 +960,17 @@ function App() {
   }, [skillsLoaded, skillsReloadToken, view])
 
   useEffect(() => {
+    if ((view !== 'chat' && view !== 'review') || !selectedProjectId) {
+      fileChangesRequestRef.current += 1
+      setFileChanges(null)
+      setFileChangesError('')
+      setLoadingFileChanges(false)
+      return
+    }
+    void refreshFileChanges(selectedProjectId)
+  }, [refreshFileChanges, selectedProjectId, view])
+
+  useEffect(() => {
     if (view !== 'skills' || !selectedSkillName) return
 
     let cancelled = false
@@ -937,7 +1001,7 @@ function App() {
     setMessages([])
     setRuns([])
     setSteps([])
-    setStreamText('')
+    setRunStream({ runId: null, text: '' })
     setActiveRun(null)
     setRunPerformance(null)
     if (!selectedThreadId) return
@@ -1001,6 +1065,74 @@ function App() {
     }
   }
 
+  async function handleStartReview(
+    scope: ReviewScope,
+    existingRunId: string | null,
+    source: ReviewSource,
+    prNumber: number | null,
+  ) {
+    if (existingRunId) {
+      return startCodeReview(existingRunId, scope, source, prNumber)
+    }
+    if (!selectedProjectId) throw new Error('找不到当前项目。')
+
+    let threadId = selectedThreadId
+    if (!threadId) {
+      const thread = await createThread(selectedProjectId, '代码审查')
+      setThreads((current) => [thread, ...current])
+      setSelectedThreadId(thread.thread_id)
+      threadId = thread.thread_id
+    }
+    const result = await createCodeReviewRun(
+      threadId,
+      scope,
+      source,
+      prNumber,
+    )
+    try {
+      const [reviewRun, performance] = await Promise.all([
+        getRun(result.run_id),
+        getRunPerformance(result.run_id),
+      ])
+      setRuns((current) => (
+        current.some((run) => run.run_id === reviewRun.run_id)
+          ? current.map((run) => run.run_id === reviewRun.run_id ? reviewRun : run)
+          : [...current, reviewRun]
+      ))
+      setRunPerformance(performance)
+      setActiveRun(null)
+    } catch {
+      setNotice('审查已完成，Run 历史将在返回聊天后刷新')
+    }
+    return result
+  }
+
+  function openRepositoryReview(projectId: string) {
+    setSelectedProjectId(projectId)
+    setSelectedThreadId(null)
+    setReviewRunId(null)
+    setReviewReturnView('repositories')
+    setView('review')
+    setMobileSidebarOpen(false)
+  }
+
+  function openRunReview(runId: string) {
+    setReviewRunId(runId)
+    setReviewReturnView('chat')
+    setView('review')
+    setMobileSidebarOpen(false)
+  }
+
+  function closeReview() {
+    setView(reviewReturnView)
+    if (reviewReturnView === 'chat' && selectedThreadId) {
+      void refreshConversation(selectedThreadId, reviewRunId ?? undefined)
+        .catch((error: unknown) => {
+          setNotice(error instanceof Error ? error.message : 'Run 历史刷新失败')
+        })
+    }
+  }
+
   async function handleCreateProject(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setProjectError('')
@@ -1023,10 +1155,10 @@ function App() {
     if (!content || !selectedThreadId || submitting || activeRun?.status === 'pending' || activeRun?.status === 'running') return
     setSubmitting(true)
     setSteps([])
-    setStreamText('')
+    setRunStream({ runId: null, text: '' })
     setRunPerformance(null)
     try {
-      const created = await startRun(selectedThreadId, content, taskKind)
+      const created = await startRun(selectedThreadId, content, taskKind, networkAccess)
       setMessages((current) => [...current, created.message])
       setActiveRun(created.run)
       setRuns((current) => [...current, created.run])
@@ -1080,7 +1212,7 @@ function App() {
             {loadingProjects ? <p className="sidebar-empty">正在加载项目…</p> : null}
             {!loadingProjects && !filteredProjects.length ? <p className="sidebar-empty">还没有登记项目</p> : null}
             {filteredProjects.map((project, index) => (
-              <button key={project.project_id} className={`project-item ${selectedProjectId === project.project_id && view === 'chat' ? 'active' : ''}`} type="button" onClick={() => selectProject(project.project_id)}>
+              <button key={project.project_id} className={`project-item ${selectedProjectId === project.project_id && (view === 'chat' || view === 'review') ? 'active' : ''}`} type="button" onClick={() => selectProject(project.project_id)}>
                 <span className={`project-icon project-color-${index % 4}`}><Icon name="folder" size={16} /></span>
                 <span>{project.name}</span>
               </button>
@@ -1108,15 +1240,25 @@ function App() {
       </aside>
 
       <section className="content-shell">
-        <header className="topbar">
+        {view !== 'review' ? <header className="topbar">
           <div className="topbar-leading"><button className="icon-button mobile-menu" type="button" aria-label="打开导航" onClick={() => setMobileSidebarOpen(true)}><Icon name="message" /></button><div className="breadcrumbs"><strong>{view === 'chat' ? selectedProject?.name ?? 'Tang Agent' : 'Tang Agent'}</strong><span>/</span><span>{view === 'skills' ? 'Skills' : view === 'repositories' ? 'Repositories' : selectedThread?.title ?? '新对话'}</span></div></div>
           <div className="topbar-actions">
             <label className="search-box"><Icon name="search" size={17} /><input ref={searchInputRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={view === 'repositories' ? '搜索仓库' : view === 'skills' ? '搜索 Skill' : '搜索'} /><kbd>⌘ K</kbd></label>
             {view === 'chat' ? <><span className="topbar-separator" /><button className={`icon-button ${showRunPanel ? 'active' : ''}`} type="button" title="执行状态" onClick={() => setShowRunPanel((value) => !value)}><Icon name="terminal" /></button><button className="icon-button" type="button" title="历史记录"><Icon name="history" /></button><button className="icon-button" type="button" title="文档"><Icon name="book" /></button><button className="icon-button" type="button" title="设置"><Icon name="settings" /></button></> : null}
           </div>
-        </header>
+        </header> : null}
 
-        {view === 'skills' ? (
+        {view === 'review' && selectedProject ? (
+          <ReviewWorkspace
+            project={selectedProject}
+            threadId={selectedThreadId}
+            runId={reviewRunId}
+            hasLocalChanges={fileChanges ? fileChanges.changed_files > 0 : null}
+            onBack={closeReview}
+            onStartReview={handleStartReview}
+            onRunChanged={setReviewRunId}
+          />
+        ) : view === 'skills' ? (
           <main className="skills-page">
             <div className="skills-toolbar">
               <div>
@@ -1167,7 +1309,7 @@ function App() {
             )}
           </main>
         ) : view === 'repositories' ? (
-          <RepositoriesPage search={search} />
+          <RepositoriesPage search={search} projects={projects} onOpenReview={openRepositoryReview} />
         ) : (
           <div className={`chat-layout ${showRunPanel ? '' : 'panel-hidden'}`}>
             <main className="conversation-column">
@@ -1218,15 +1360,53 @@ function App() {
                     {showTaskKindMenu ? <div className="task-kind-menu" role="listbox" aria-label="Agent 模式">{taskKinds.map((item) => <button className={item.value === taskKind ? 'selected' : ''} type="button" role="option" aria-selected={item.value === taskKind} key={item.value} onClick={() => { setTaskKind(item.value); setShowTaskKindMenu(false) }}><Icon name={item.icon} size={17} /><span>{item.value}</span>{item.value === taskKind ? <Icon name="check" size={16} /> : null}</button>)}</div> : null}
                     <button className="task-kind-trigger" type="button" aria-haspopup="listbox" aria-expanded={showTaskKindMenu} onClick={() => setShowTaskKindMenu((value) => !value)}><Icon name={selectedTaskKind.icon} size={17} /><span>{taskKind}</span><Icon name="chevron-down" size={14} /></button>
                   </div>
+                  <div className="network-access-picker" ref={networkMenuRef}>
+                    {showNetworkMenu ? <div className="network-access-menu" role="menu" aria-label="联网设置"><button type="button" role="menuitemradio" aria-checked={!networkAccess} className={!networkAccess ? 'selected' : ''} onClick={() => { setNetworkAccess(false); setShowNetworkMenu(false) }}><Globe2 size={16} /><span><strong>禁止联网</strong><small>仅使用本地信息</small></span>{!networkAccess ? <Icon name="check" size={15} /> : null}</button><button type="button" role="menuitemradio" aria-checked={networkAccess} className={networkAccess ? 'selected' : ''} onClick={() => { setNetworkAccess(true); setShowNetworkMenu(false) }}><Globe2 size={16} /><span><strong>允许联网</strong><small>{toolCapabilities?.web_search.provider ?? '固定搜索提供商'}</small></span>{networkAccess ? <Icon name="check" size={15} /> : null}</button>{networkAccess && (capabilityError || toolCapabilities?.web_search.unavailable_reason) ? <p role="status">{capabilityError || toolCapabilities?.web_search.unavailable_reason}</p> : null}</div> : null}
+                    <button className={`network-access-trigger ${networkAccess ? 'enabled' : ''} ${networkAccess && toolCapabilities && !toolCapabilities.web_search.available ? 'unavailable' : ''}`} type="button" aria-haspopup="menu" aria-expanded={showNetworkMenu} disabled={isRunning} title={capabilityError || toolCapabilities?.web_search.unavailable_reason || (networkAccess ? '下一次 Run 允许结构化网页搜索' : '下一次 Run 禁止联网搜索')} onClick={() => setShowNetworkMenu((value) => !value)}><Globe2 size={16} /><span>联网</span><small>{networkAccess ? '开启' : '关闭'}</small><Icon name="chevron-down" size={13} /></button>
+                  </div>
                   <div className="composer-hint"><span>Enter 发送，Shift + Enter 换行</span><span>{notice}</span></div>
                 </div>
               </form>
             </main>
 
             <aside className={`run-panel ${showRunPanel ? 'open' : ''}`}>
-              <div className="run-panel-header"><strong>Agent 执行状态</strong><span className={`run-state ${isRunning ? 'running' : lastRun?.status === 'failed' ? 'failed' : ''}`}><i />{isRunning ? '运行中' : lastRun?.status === 'failed' ? '失败' : lastRun?.status === 'completed' ? '已完成' : '空闲'}</span></div>
-              <div className="run-panel-section"><h2>执行步骤</h2>{steps.length ? <ol className="step-list">{steps.map((step, index) => <li key={step.id} className={`step-${step.status} ${step.source.startsWith('subagent') ? 'step-subagent' : ''}`}><span className="step-number">{step.status === 'completed' ? <Icon name="check" size={14} /> : index + 1}</span><div><div className="step-title"><strong>{step.title}</strong><time>{timeLabel(step.createdAt)}</time></div><p>{step.detail}</p></div></li>)}</ol> : <div className="steps-empty"><Icon name="clock" /><p>发送任务后，这里会实时显示 Agent 的执行过程。</p></div>}</div>
-              <div className="run-details"><div className="details-heading"><strong>任务详情</strong><Icon name="chevron-down" size={16} /></div><dl><div><dt>任务 ID</dt><dd title={lastRun?.run_id}>{lastRun?.run_id.slice(0, 10) ?? '—'}</dd></div><div><dt>创建时间</dt><dd>{lastRun ? new Date(lastRun.created_at).toLocaleString('zh-CN') : '—'}</dd></div><div><dt>执行模式</dt><dd>{lastRun?.task_kind ?? '—'}</dd></div><div><dt>首个输出</dt><dd>{durationLabel(runPerformance?.first_output_ms)}</dd></div><div><dt>运行耗时</dt><dd>{durationLabel(runPerformance?.duration_ms)}</dd></div><div><dt>模型调用</dt><dd>{runPerformance ? `${runPerformance.model_calls} / ${runPerformance.max_model_calls}` : '—'}</dd></div><div><dt>工具调用</dt><dd>{runPerformance ? `${runPerformance.tool_calls} / ${runPerformance.max_tool_calls}` : '—'}</dd></div><div><dt>重复调用</dt><dd>{runPerformance?.repeated_tool_calls ?? '—'}</dd></div><div><dt>工具错误</dt><dd>{runPerformance ? `${runPerformance.tool_errors}（拒绝 ${runPerformance.safety_rejections}）` : '—'}</dd></div>{runPerformance?.termination_reason ? <div className="termination-detail"><dt>终止原因</dt><dd title={lastRun?.error ?? undefined}>{terminationLabels[runPerformance.termination_reason] ?? runPerformance.termination_reason}</dd></div> : null}<div><dt>模型</dt><dd>DeepSeek V4</dd></div><div><dt>项目路径</dt><dd title={selectedProject?.virtual_path}>{selectedProject?.virtual_path ?? '—'}</dd></div></dl></div>
+              <div className="run-panel-header"><strong>Agent 执行状态</strong><div className="run-panel-header-actions">{lastRun ? <button className="run-review-entry" type="button" disabled={isRunning} title="打开此 Run 的代码审查" onClick={() => openRunReview(lastRun.run_id)}><ScanSearch size={14} />审查</button> : null}<span className={`run-state ${isRunning ? 'running' : lastRun?.status === 'failed' ? 'failed' : ''}`}><i />{isRunning ? '运行中' : lastRun?.status === 'failed' ? '失败' : lastRun?.status === 'completed' ? '已完成' : '空闲'}</span></div></div>
+              <div className="run-panel-section"><h2>执行步骤</h2>{steps.length ? <ol className="step-list">{steps.map((step, index) => <li key={step.id} className={`step-${step.status} ${step.source.startsWith('subagent') ? 'step-subagent' : ''}`}><span className="step-number">{step.status === 'completed' ? <Icon name="check" size={14} /> : index + 1}</span><div><div className="step-title"><strong>{step.title}</strong><time>{timeLabel(step.createdAt)}</time></div><p>{step.detail}</p>{step.sources?.length ? <div className="step-sources">{step.sources.map((source) => <a key={`${source.citation_id}:${source.url}`} href={source.url} target="_blank" rel="noopener noreferrer" title={source.url}><span>{source.citation_id}</span>{source.title}</a>)}</div> : null}</div></li>)}</ol> : <div className="steps-empty"><Icon name="clock" /><p>发送任务后，这里会实时显示 Agent 的执行过程。</p></div>}</div>
+              <section className="file-changes-section" aria-live="polite">
+                <div className="file-changes-heading">
+                  <strong>文件更改</strong>
+                  {fileChanges?.changed_files ? <span>{fileChanges.changed_files} 个文件</span> : null}
+                </div>
+                {loadingFileChanges ? (
+                  <div className="file-changes-state"><span className="loading-ring" /><span>正在统计…</span></div>
+                ) : fileChangesError ? (
+                  <div className="file-changes-state error" role="alert">{fileChangesError}</div>
+                ) : fileChanges && fileChanges.changed_files > 0 ? (
+                  <>
+                    <div className="file-changes-totals"><span className="addition">+{fileChanges.additions}</span><span className="deletion">-{fileChanges.deletions}</span>{fileChanges.binary_files ? <span>{fileChanges.binary_files} 个二进制文件</span> : null}</div>
+                    <ul className="file-change-list">
+                      {fileChanges.files.map((file) => {
+                        const relativePath = file.path.startsWith(`${fileChanges.project_path}/`)
+                          ? file.path.slice(fileChanges.project_path.length + 1)
+                          : file.path
+                        return (
+                          <li key={file.path} className={`file-change-${file.status}`}>
+                            <span className="file-change-icon"><Icon name="code" size={14} /></span>
+                            <code title={file.path}>{relativePath}</code>
+                            <span className="file-change-counts">
+                              {file.binary ? <span className="binary-change">BIN</span> : <><span className="addition">+{file.additions ?? 0}</span><span className="deletion">-{file.deletions ?? 0}</span></>}
+                            </span>
+                          </li>
+                        )
+                      })}
+                    </ul>
+                    {fileChanges.hidden_files ? <p className="hidden-file-note">另有 {fileChanges.hidden_files} 个敏感文件未显示</p> : null}
+                  </>
+                ) : (
+                  <div className="file-changes-state">工作区没有未提交更改</div>
+                )}
+              </section>
+              <div className="run-details"><div className="details-heading"><strong>任务详情</strong><Icon name="chevron-down" size={16} /></div><dl><div><dt>任务 ID</dt><dd title={lastRun?.run_id}>{lastRun?.run_id.slice(0, 10) ?? '—'}</dd></div><div><dt>创建时间</dt><dd>{lastRun ? new Date(lastRun.created_at).toLocaleString('zh-CN') : '—'}</dd></div><div><dt>执行模式</dt><dd>{lastRun?.task_kind ?? '—'}</dd></div><div><dt>联网</dt><dd>{lastRun ? lastRun.network_access ? `${lastRun.network_provider} · ${lastRun.network_request_count} 次请求` : '禁止' : '—'}</dd></div><div><dt>搜索结果</dt><dd>{lastRun ? `${lastRun.network_result_count} 条${lastRun.network_cache_hit_count ? ` · 缓存 ${lastRun.network_cache_hit_count}` : ''}` : '—'}</dd></div><div><dt>首个输出</dt><dd>{durationLabel(runPerformance?.first_output_ms)}</dd></div><div><dt>运行耗时</dt><dd>{durationLabel(runPerformance?.duration_ms)}</dd></div><div><dt>模型调用</dt><dd>{runPerformance ? `${runPerformance.model_calls} / ${runPerformance.max_model_calls}` : '—'}</dd></div><div><dt>工具调用</dt><dd>{runPerformance ? `${runPerformance.tool_calls} / ${runPerformance.max_tool_calls}` : '—'}</dd></div><div><dt>重复调用</dt><dd>{runPerformance?.repeated_tool_calls ?? '—'}</dd></div><div><dt>工具错误</dt><dd>{runPerformance ? `${runPerformance.tool_errors}（拒绝 ${runPerformance.safety_rejections}）` : '—'}</dd></div>{lastRun?.network_limit_reached ? <div className="termination-detail"><dt>联网限制</dt><dd>{lastRun.network_limit_reason ?? '已达到预算'}</dd></div> : null}{runPerformance?.termination_reason ? <div className="termination-detail"><dt>终止原因</dt><dd title={lastRun?.error ?? undefined}>{terminationLabels[runPerformance.termination_reason] ?? runPerformance.termination_reason}</dd></div> : null}<div><dt>模型</dt><dd>DeepSeek V4</dd></div><div><dt>项目路径</dt><dd title={selectedProject?.virtual_path}>{selectedProject?.virtual_path ?? '—'}</dd></div></dl></div>
             </aside>
           </div>
         )}

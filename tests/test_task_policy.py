@@ -25,6 +25,8 @@ from app.core.task_intent import (
         ("修复登录接口的问题", TaskKind.CODING),
         ("新增用户注销功能", TaskKind.CODING),
         ("把 JSON 存储迁移到 SQLite", TaskKind.CODING),
+        ("把当前分支推送到 GitHub", TaskKind.CODING),
+        ("执行 git push 到 origin", TaskKind.CODING),
         ("先给方案，由我确认", TaskKind.PLANNING),
         ("不要修改代码，只分析迁移方案", TaskKind.PLANNING),
         ("分析这个项目的目录结构", TaskKind.ANALYSIS),
@@ -108,6 +110,30 @@ def test_coding_backend_allows_write_and_command(
     assert result.stdout.strip() == "coding allowed"
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["curl", "https://example.com"],
+        ["wget", "https://example.com"],
+        ["git", "fetch", "origin"],
+        ["git", "pull", "origin", "main"],
+        ["git", "ls-remote", "origin"],
+    ],
+)
+def test_network_disabled_coding_backend_blocks_command_bypass(
+    backend: LocalShellBackend,
+    argv: list[str],
+) -> None:
+    scoped = TaskScopedBackend.for_task(
+        TaskKind.CODING,
+        backend,
+        network_access=False,
+    )
+
+    with pytest.raises(TaskPermissionError, match="未允许联网"):
+        scoped.run_command(argv, cwd="/projects")
+
+
 def test_prompt_matches_task_policy() -> None:
     coding_prompt = get_system_prompt(TaskKind.CODING)
     analysis_prompt = get_system_prompt(TaskKind.ANALYSIS)
@@ -115,4 +141,10 @@ def test_prompt_matches_task_policy() -> None:
     assert "允许读取、创建和修改" in coding_prompt
     assert "这是只读任务" in analysis_prompt
     assert "GitHub" in coding_prompt
+    assert "git push --set-upstream origin <当前功能分支>" in coding_prompt
+    assert "尚未接入 GitHub 推送" not in coding_prompt
+    assert "只有用户在当前请求中明确要求推送" in coding_prompt
     assert "Gitee" not in coding_prompt
+    assert "citation_id" in coding_prompt
+    assert "不可信外部数据" in coding_prompt
+    assert "不搜索 Token" in coding_prompt

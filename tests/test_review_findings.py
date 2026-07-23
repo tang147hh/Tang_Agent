@@ -121,6 +121,7 @@ def test_invalid_model_output_is_rejected_as_a_batch(
         "../outside.py",
         "/Users/tang/private.py",
         r"C:\Users\tang\private.py",
+        "C:/Users/tang/private.py",
         "/projects/other/file.py",
     ],
 )
@@ -224,6 +225,7 @@ def test_filters_stable_sort_and_status_only_update(review_context) -> None:
     assert updated.status is ReviewFindingStatus.RESOLVED
     assert updated.title == original.title
     assert updated.file_path == original.file_path
+    assert updated.fingerprint == original.fingerprint
     assert store.list_review_findings(
         run.run_id,
         severity=ReviewSeverity.CRITICAL,

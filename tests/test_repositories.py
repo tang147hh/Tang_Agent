@@ -142,6 +142,85 @@ def test_hides_absolute_local_remote_path(
     assert str(tmp_path) not in snapshot.remote_url
 
 
+def test_reports_safe_file_change_line_counts(
+    workspace: Workspace,
+) -> None:
+    target = workspace.resolve("/projects/demo")
+    _initialize_repository(target)
+    target.joinpath("obsolete.txt").write_text(
+        "first\nsecond\n",
+        encoding="utf-8",
+    )
+    _git(target, "add", "obsolete.txt")
+    _git(target, "commit", "-m", "Add obsolete file")
+
+    target.joinpath("README.md").write_text(
+        "# Demo\nNew line\n",
+        encoding="utf-8",
+    )
+    target.joinpath("obsolete.txt").unlink()
+    target.joinpath("new file.txt").write_text(
+        "one\ntwo\n",
+        encoding="utf-8",
+    )
+    target.joinpath("image.bin").write_bytes(b"\x00\x01")
+    target.joinpath(".env").write_text(
+        "SECRET=hidden\n",
+        encoding="utf-8",
+    )
+
+    summary = RepositoryCatalog(workspace).file_changes("demo")
+    changes = {item.path: item for item in summary.files}
+
+    assert summary.project_path == "/projects/demo"
+    assert summary.changed_files == 4
+    assert summary.additions == 3
+    assert summary.deletions == 2
+    assert summary.binary_files == 1
+    assert summary.hidden_files == 1
+    assert changes["/projects/demo/README.md"].additions == 1
+    assert changes["/projects/demo/README.md"].deletions == 0
+    assert changes["/projects/demo/obsolete.txt"].deletions == 2
+    assert changes["/projects/demo/new file.txt"].additions == 2
+    assert changes["/projects/demo/new file.txt"].status == "untracked"
+    assert changes["/projects/demo/image.bin"].binary is True
+    assert changes["/projects/demo/image.bin"].additions is None
+    assert all(not item.path.endswith("/.env") for item in summary.files)
+
+
+def test_file_changes_are_empty_for_clean_repository(
+    workspace: Workspace,
+) -> None:
+    _initialize_repository(workspace.resolve("/projects/demo"))
+
+    summary = RepositoryCatalog(workspace).file_changes("demo")
+
+    assert summary.changed_files == 0
+    assert summary.additions == 0
+    assert summary.deletions == 0
+    assert summary.files == ()
+
+
+def test_file_changes_support_repository_without_head(
+    workspace: Workspace,
+) -> None:
+    target = workspace.resolve("/projects/demo")
+    target.mkdir()
+    _git(target, "init", "-b", "main")
+    target.joinpath("first.txt").write_text(
+        "first\nsecond\n",
+        encoding="utf-8",
+    )
+    _git(target, "add", "first.txt")
+
+    summary = RepositoryCatalog(workspace).file_changes("demo")
+
+    assert summary.changed_files == 1
+    assert summary.additions == 2
+    assert summary.deletions == 0
+    assert summary.files[0].status == "added"
+
+
 def test_clones_valid_github_https_url_without_network(
     workspace: Workspace,
 ) -> None:

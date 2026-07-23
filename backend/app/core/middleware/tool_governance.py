@@ -9,6 +9,7 @@ from langchain.agents.middleware.types import AgentMiddleware, AgentState
 from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
+from pydantic import ValidationError
 
 from app.backends.command_runner import CommandPolicyError
 from app.backends.local_shell import BackendFileError
@@ -119,6 +120,19 @@ class ToolGovernanceMiddleware(AgentMiddleware):
                 WorkspacePathError,
             ),
         )
+        tool_name = str(_tool_call(request).get("name") or "unknown")
+        if isinstance(error, ValidationError) and tool_name == "web_search":
+            return _tool_message(
+                request,
+                {
+                    "status": "rejected",
+                    "error_code": "network_invalid_request",
+                    "error_type": "ValidationError",
+                    "error": "网页搜索参数格式无效。",
+                    "recoverable": True,
+                    "hint": "请使用 query、max_results、allowed_domains 和 recency_days 的受支持格式。",
+                },
+            )
         return _tool_message(
             request,
             {
@@ -147,6 +161,8 @@ class ToolGovernanceMiddleware(AgentMiddleware):
             raise
         except RECOVERABLE_TOOL_ERRORS as exc:
             return self._recoverable_error(request, exc)
+        except ValidationError as exc:
+            return self._recoverable_error(request, exc)
 
     async def awrap_tool_call(
         self,
@@ -164,4 +180,6 @@ class ToolGovernanceMiddleware(AgentMiddleware):
         except RunLimitExceeded:
             raise
         except RECOVERABLE_TOOL_ERRORS as exc:
+            return self._recoverable_error(request, exc)
+        except ValidationError as exc:
             return self._recoverable_error(request, exc)

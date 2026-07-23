@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,12 +27,35 @@ from app.core.run_limits import (
     RunTerminationReason,
     budget_for,
     iter_with_deadline,
+    network_budget_for,
+)
+from app.tools.web_search import (
+    DisabledSearchProvider,
+    SearchCache,
+    SearchProvider,
+    SearchRuntime,
+    clean_search_event_text,
+    normalize_result_url,
+    safe_query_for_event,
 )
 
 logger = logging.getLogger(__name__)
 
 AgentFactory = Callable[[Any], Any]
 TOKEN_EVENT_FLUSH_CHARS = 80
+WORKSPACE_SEARCH_TOOL_NAMES = {
+    "workspace_glob",
+    "workspace_search",
+}
+_EVENT_VIRTUAL_ROOTS = {
+    "projects",
+    "skills",
+    "policies",
+    "reviews",
+    "runtimes",
+    "tmp",
+    "logs",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +175,17 @@ def _tool_calls(message: Any) -> list[_ToolCall]:
 
         seen.add(key)
 
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                # 流式工具调用先发送名称和 ID，参数 JSON 会在后续
+                # chunk 中补齐。未完成的参数不能参与重复调用指纹，
+                # 否则多个同名工具都会被误判为相同调用。
+                arguments = {
+                    "__incomplete_tool_call_id__": normalized_call_id,
+                }
+
         subagent = None
 
         if name == "task" and isinstance(arguments, dict):
@@ -205,6 +240,185 @@ def _tool_result_flags(message: Any) -> tuple[bool, bool]:
         "WorkspacePathError",
     }
     return is_error, is_safety_rejection
+
+
+def _tool_result_payload(message: Any) -> dict[str, Any] | None:
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            return None
+    return content if isinstance(content, dict) else None
+
+
+def _search_started_payload(
+    arguments: Any,
+    *,
+    provider: str,
+) -> dict[str, Any]:
+    values = arguments if isinstance(arguments, dict) else {}
+    max_results = values.get("max_results", 5)
+    if isinstance(max_results, bool) or not isinstance(max_results, int):
+        max_results = 5
+    return {
+        "query": safe_query_for_event(values.get("query")),
+        "provider": provider,
+        "max_results": max(1, min(max_results, 5)),
+    }
+
+
+def _search_finished_payload(message: Any) -> dict[str, Any]:
+    result = _tool_result_payload(message) or {}
+    try:
+        result_count = max(int(result.get("result_count") or 0), 0)
+    except (TypeError, ValueError):
+        result_count = 0
+    try:
+        duration_ms = max(float(result.get("duration_ms") or 0), 0)
+    except (TypeError, ValueError):
+        duration_ms = 0
+    payload: dict[str, Any] = {
+        "result_count": result_count,
+        "duration_ms": duration_ms,
+        "cached": result.get("cached") is True,
+        "truncated": result.get("truncated") is True,
+        "sources": [],
+    }
+    raw_sources = result.get("results")
+    if isinstance(raw_sources, list):
+        sources: list[dict[str, str]] = []
+        for item in raw_sources[:5]:
+            if not isinstance(item, dict):
+                continue
+            normalized = normalize_result_url(str(item.get("url") or ""))
+            if normalized is None:
+                continue
+            title = clean_search_event_text(item.get("title"), 300)
+            citation_id = str(item.get("citation_id") or "")[:10]
+            sources.append(
+                {
+                    "citation_id": citation_id,
+                    "title": title or normalized[1],
+                    "url": normalized[0],
+                }
+            )
+        payload["sources"] = sources
+    error_code = result.get("error_code")
+    error = result.get("error")
+    if isinstance(error_code, str) and error_code:
+        payload["error_code"] = error_code[:100]
+    if isinstance(error, str) and error:
+        payload["error"] = clean_search_event_text(error, 500)
+    return payload
+
+
+def _safe_workspace_event_path(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 1_000:
+        return "/projects"
+    if (
+        not value.startswith("/")
+        or value.startswith("//")
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return "/projects"
+    parts = tuple(part for part in value.split("/") if part)
+    if (
+        not parts
+        or parts[0] not in _EVENT_VIRTUAL_ROOTS
+        or ".." in parts
+        or ".secrets" in parts
+    ):
+        return "/projects"
+    return "/" + "/".join(parts)
+
+
+def _safe_workspace_event_pattern(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > 512:
+        return "**/*"
+    if (
+        value.startswith("/")
+        or (len(value) > 1 and value[0].isalpha() and value[1] == ":")
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return "**/*"
+    parts = value.split("/")
+    if any(part in {"", ".", "..", ".secrets"} for part in parts):
+        return "**/*"
+    return value
+
+
+def _workspace_search_started_payload(
+    tool_name: str,
+    arguments: Any,
+) -> dict[str, Any]:
+    values = arguments if isinstance(arguments, dict) else {}
+    raw_max_results = values.get("max_results", 100)
+    if isinstance(raw_max_results, bool) or not isinstance(raw_max_results, int):
+        raw_max_results = 100
+    payload: dict[str, Any] = {
+        "path": _safe_workspace_event_path(values.get("path", "/projects")),
+        "max_results": max(1, min(raw_max_results, 500)),
+    }
+    if tool_name == "workspace_glob":
+        payload["pattern"] = _safe_workspace_event_pattern(
+            values.get("pattern")
+        )
+    else:
+        payload["file_pattern"] = _safe_workspace_event_pattern(
+            values.get("file_pattern", "**/*")
+        )
+    return payload
+
+
+def _non_negative_int(value: Any) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _workspace_search_finished_payload(message: Any) -> dict[str, Any]:
+    result = _tool_result_payload(message) or {}
+    try:
+        duration_ms = max(float(result.get("duration_ms") or 0), 0)
+    except (TypeError, ValueError):
+        duration_ms = 0
+    return {
+        "match_count": _non_negative_int(result.get("match_count")),
+        "files_searched": _non_negative_int(result.get("files_searched")),
+        "skipped_file_count": _non_negative_int(
+            result.get("skipped_file_count")
+        ),
+        "scanned_entry_count": _non_negative_int(
+            result.get("scanned_entry_count")
+        ),
+        "scanned_bytes": _non_negative_int(result.get("scanned_bytes")),
+        "duration_ms": duration_ms,
+        "truncated": result.get("truncated") is True,
+    }
+
+
+def _build_run_agent(
+    factory: AgentFactory,
+    task_kind: Any,
+    search_runtime: SearchRuntime,
+) -> Any:
+    """兼容第 38 课的一参数测试 factory，同时给正式 factory 传 Run 能力。"""
+
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError):
+        return factory(task_kind)
+    supports_runtime = "search_runtime" in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if supports_runtime:
+        return factory(task_kind, search_runtime=search_runtime)
+    return factory(task_kind)
 
 
 def _initialize_performance(
@@ -295,10 +509,13 @@ def run_conversation_agent(
     conversation_store: ConversationStore,
     agent_factory: AgentFactory,
     workspace: Workspace | None = None,
+    search_provider: SearchProvider | None = None,
+    search_cache: SearchCache | None = None,
 ) -> None:
     """执行一个已经创建的会话 Run。"""
 
     tracker: RunBudgetTracker | None = None
+    search_runtime: SearchRuntime | None = None
     termination_reason: RunTerminationReason | None = None
     try:
         run = conversation_store.get_run(run_id)
@@ -336,7 +553,19 @@ def run_conversation_agent(
             budget=budget,
         )
         tracker = RunBudgetTracker(budget)
-        agent = agent_factory(run.task_kind)
+        search_runtime = SearchRuntime(
+            task_kind=run.task_kind,
+            network_access=run.network_access,
+            provider=search_provider or DisabledSearchProvider(),
+            budget=network_budget_for(run.task_kind),
+            cache=search_cache or SearchCache(),
+            expected_provider_name=run.network_provider,
+        )
+        agent = _build_run_agent(
+            agent_factory,
+            run.task_kind,
+            search_runtime,
+        )
 
         model_messages = _model_messages(
             messages,
@@ -358,6 +587,8 @@ def run_conversation_agent(
             payload={
                 "status": "pending",
                 "task_kind": run.task_kind.value,
+                "network_access": run.network_access,
+                "network_provider": run.network_provider,
                 "budget": {
                     "max_model_calls": budget.max_model_calls,
                     "max_tool_calls": budget.max_tool_calls,
@@ -367,6 +598,24 @@ def run_conversation_agent(
                     "max_seconds": budget.max_seconds,
                     "max_identical_tool_calls": (
                         budget.max_identical_tool_calls
+                    ),
+                },
+                "network_budget": {
+                    "max_searches": search_runtime.budget.max_searches,
+                    "max_results_per_search": (
+                        search_runtime.budget.max_results_per_search
+                    ),
+                    "request_timeout_seconds": (
+                        search_runtime.budget.request_timeout_seconds
+                    ),
+                    "max_result_chars_per_search": (
+                        search_runtime.budget.max_result_chars_per_search
+                    ),
+                    "max_total_result_chars": (
+                        search_runtime.budget.max_total_result_chars
+                    ),
+                    "max_bytes_received": (
+                        search_runtime.budget.max_bytes_received
                     ),
                 },
             },
@@ -381,6 +630,8 @@ def run_conversation_agent(
             payload={
                 "status": "running",
                 "task_kind": run.task_kind.value,
+                "network_access": run.network_access,
+                "network_provider": run.network_provider,
                 "budget": {
                     "max_model_calls": budget.max_model_calls,
                     "max_tool_calls": budget.max_tool_calls,
@@ -390,6 +641,24 @@ def run_conversation_agent(
                     "max_seconds": budget.max_seconds,
                     "max_identical_tool_calls": (
                         budget.max_identical_tool_calls
+                    ),
+                },
+                "network_budget": {
+                    "max_searches": search_runtime.budget.max_searches,
+                    "max_results_per_search": (
+                        search_runtime.budget.max_results_per_search
+                    ),
+                    "request_timeout_seconds": (
+                        search_runtime.budget.request_timeout_seconds
+                    ),
+                    "max_result_chars_per_search": (
+                        search_runtime.budget.max_result_chars_per_search
+                    ),
+                    "max_total_result_chars": (
+                        search_runtime.budget.max_total_result_chars
+                    ),
+                    "max_bytes_received": (
+                        search_runtime.budget.max_bytes_received
                     ),
                 },
             },
@@ -503,6 +772,21 @@ def run_conversation_agent(
                     if subagent is not None:
                         payload["subagent"] = subagent
 
+                    if tool_call.name == "web_search":
+                        payload.update(
+                            _search_started_payload(
+                                tool_call.arguments,
+                                provider=run.network_provider,
+                            )
+                        )
+                    elif tool_call.name in WORKSPACE_SEARCH_TOOL_NAMES:
+                        payload.update(
+                            _workspace_search_started_payload(
+                                tool_call.name,
+                                tool_call.arguments,
+                            )
+                        )
+
                     conversation_store.append_run_event(
                         run_id=run_id,
                         kind="tool_started",
@@ -559,6 +843,23 @@ def run_conversation_agent(
                 if subagent is not None:
                     payload["subagent"] = subagent
 
+                if tool_name == "web_search":
+                    payload.update(_search_finished_payload(message))
+                    network_metrics = search_runtime.metrics()
+                    conversation_store.update_run_network_metrics(
+                        run_id=run_id,
+                        request_count=network_metrics.request_count,
+                        result_count=network_metrics.result_count,
+                        bytes_received=network_metrics.bytes_received,
+                        cache_hit_count=network_metrics.cache_hit_count,
+                        limit_reached=network_metrics.limit_reached,
+                        limit_reason=network_metrics.limit_reason,
+                    )
+                elif tool_name in WORKSPACE_SEARCH_TOOL_NAMES:
+                    payload.update(
+                        _workspace_search_finished_payload(message)
+                    )
+
                 if subagent == "reviewer" and not is_error:
                     if workspace is None:
                         raise ReviewOutputError(
@@ -570,6 +871,7 @@ def run_conversation_agent(
                     ).save_model_output(
                         run_id=run_id,
                         raw_output=getattr(message, "content", None),
+                        require_review_diff=True,
                     )
                     conversation_store.append_run_event(
                         run_id=run_id,
@@ -718,6 +1020,23 @@ def run_conversation_agent(
                 run_id,
             )
     finally:
+        if search_runtime is not None:
+            try:
+                metrics = search_runtime.metrics()
+                conversation_store.update_run_network_metrics(
+                    run_id=run_id,
+                    request_count=metrics.request_count,
+                    result_count=metrics.result_count,
+                    bytes_received=metrics.bytes_received,
+                    cache_hit_count=metrics.cache_hit_count,
+                    limit_reached=metrics.limit_reached,
+                    limit_reason=metrics.limit_reason,
+                )
+            except Exception:
+                logger.exception(
+                    "记录 Run 网络指标失败：run_id=%s",
+                    run_id,
+                )
         if tracker is not None:
             try:
                 _persist_performance(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -94,7 +95,14 @@ def test_rejects_shell_string(
         ["git", "reset", "--hard"],
         ["git", "push", "--force"],
         ["git", "push", "--force-with-lease"],
+        ["git", "push"],
+        ["git", "push", "origin", "feature/course"],
+        ["git", "push", "--set-upstream", "upstream", "feature/course"],
+        ["git", "push", "--set-upstream", "origin", "main"],
+        ["git", "push", "--set-upstream", "origin", "feature/../main"],
         ["git", "config", "--global", "user.name", "agent"],
+        ["git", "-c", "alias.net=!curl https://example.com", "net"],
+        ["git", "--config-env=alias.net=ALIAS", "net"],
         ["python", "-c", "print('unsafe')"],
         ["python3", "-c", "print('unsafe')"],
         ["git", "-C", "../outside", "status"],
@@ -117,6 +125,42 @@ def test_rejects_sensitive_arguments(
             ["git", "clone", "https://token=secret@example.com/repo"],
             cwd="/tmp",
         )
+
+
+def test_allows_fixed_origin_feature_branch_push(
+    backend: LocalShellBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        del kwargs
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(
+        "app.backends.command_runner.subprocess.run",
+        fake_run,
+    )
+
+    result = backend.run_command(
+        [
+            "git",
+            "push",
+            "--set-upstream",
+            "origin",
+            "feature/course",
+        ],
+        cwd="/projects",
+    )
+
+    assert result.exit_code == 0
+    assert calls[0][-4:] == [
+        "push",
+        "--set-upstream",
+        "origin",
+        "feature/course",
+    ]
 
 
 def test_command_timeout(
