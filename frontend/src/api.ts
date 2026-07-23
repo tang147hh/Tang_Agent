@@ -63,6 +63,16 @@ export interface RunStartResponse {
   message: Message
 }
 
+export interface SkillSummary {
+  name: string
+  description: string
+  path: string
+}
+
+export interface SkillDetail extends SkillSummary {
+  content: string
+}
+
 export interface RunEventPayload {
   run_id: string
   source: string
@@ -165,4 +175,14 @@ export function startRun(threadId: string, content: string): Promise<RunStartRes
 
 export function runEventsUrl(runId: string): string {
   return `/api/runs/${encodeURIComponent(runId)}/events`
+}
+
+export function listSkills(): Promise<SkillSummary[]> {
+  return requestJson<SkillSummary[]>('/api/skills')
+}
+
+export function getSkill(skillName: string): Promise<SkillDetail> {
+  return requestJson<SkillDetail>(
+    `/api/skills/${encodeURIComponent(skillName)}`,
+  )
 }

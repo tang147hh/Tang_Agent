@@ -173,3 +173,12 @@ class RunCreateRequest(BaseModel):
 class RunStartResponse(BaseModel):
     run: RunResponse
     message: MessageResponse
+
+
+class SkillSummaryResponse(BaseModel):
+    name: str
+    description: str
+    path: str
+
+class SkillDetailResponse(SkillSummaryResponse):
+    content: str

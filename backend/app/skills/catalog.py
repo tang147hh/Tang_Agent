@@ -5,11 +5,8 @@ from dataclasses import dataclass
 
 from app.backends.workspace import Workspace
 
-
 MAX_SKILL_FILE_BYTES = 100_000
-SKILL_NAME_PATTERN = re.compile(
-    r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
-)
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 class SkillCatalogError(ValueError):
@@ -23,6 +20,14 @@ class SkillMetadata:
     path: str
 
 
+@dataclass(frozen=True, slots=True)
+class SkillDetail:
+    name: str
+    description: str
+    path: str
+    content: str
+
+
 def _parse_frontmatter(
     content: str,
     *,
@@ -33,9 +38,7 @@ def _parse_frontmatter(
     lines = content.splitlines()
 
     if not lines or lines[0].strip() != "---":
-        raise SkillCatalogError(
-            f"Skill 缺少 YAML frontmatter：{path}"
-        )
+        raise SkillCatalogError(f"Skill 缺少 YAML frontmatter：{path}")
 
     try:
         closing_index = next(
@@ -44,9 +47,7 @@ def _parse_frontmatter(
             if line.strip() == "---"
         )
     except StopIteration as exc:
-        raise SkillCatalogError(
-            f"Skill frontmatter 未闭合：{path}"
-        ) from exc
+        raise SkillCatalogError(f"Skill frontmatter 未闭合：{path}") from exc
 
     values: dict[str, str] = {}
 
@@ -66,19 +67,13 @@ def _parse_frontmatter(
     description = values.get("description", "")
 
     if not SKILL_NAME_PATTERN.fullmatch(name):
-        raise SkillCatalogError(
-            f"Skill name 不合法：{name or '<empty>'}"
-        )
+        raise SkillCatalogError(f"Skill name 不合法：{name or '<empty>'}")
 
     if not description:
-        raise SkillCatalogError(
-            f"Skill description 不能为空：{path}"
-        )
+        raise SkillCatalogError(f"Skill description 不能为空：{path}")
 
     if len(description) > 1_024:
-        raise SkillCatalogError(
-            f"Skill description 超过 1024 字符：{path}"
-        )
+        raise SkillCatalogError(f"Skill description 超过 1024 字符：{path}")
 
     return name, description
 
@@ -103,9 +98,7 @@ class SkillCatalog:
             if not directory.is_dir():
                 continue
 
-            virtual_path = (
-                f"/skills/{directory.name}/SKILL.md"
-            )
+            virtual_path = f"/skills/{directory.name}/SKILL.md"
             skill_path = self.workspace.resolve(virtual_path)
 
             if not skill_path.is_file():
@@ -114,9 +107,7 @@ class SkillCatalog:
             raw = skill_path.read_bytes()
 
             if len(raw) > MAX_SKILL_FILE_BYTES:
-                raise SkillCatalogError(
-                    f"Skill 文件超过大小限制：{virtual_path}"
-                )
+                raise SkillCatalogError(f"Skill 文件超过大小限制：{virtual_path}")
 
             try:
                 content = raw.decode("utf-8")
@@ -132,8 +123,7 @@ class SkillCatalog:
 
             if name != directory.name:
                 raise SkillCatalogError(
-                    "Skill name 必须与目录名一致："
-                    f"{name} != {directory.name}"
+                    "Skill name 必须与目录名一致：" f"{name} != {directory.name}"
                 )
 
             discovered.append(
@@ -145,6 +135,34 @@ class SkillCatalog:
             )
 
         return tuple(discovered)
+
+    def get(
+        self,
+        name: str,
+    ) -> SkillDetail | None:
+        normalized_name = name.strip()
+
+        if not SKILL_NAME_PATTERN.fullmatch(normalized_name):
+            raise SkillCatalogError(
+                f"Skill name 不合法：{normalized_name or '<empty>'}"
+            )
+
+        metadata = next(
+            (skill for skill in self.discover() if skill.name == normalized_name),
+            None,
+        )
+
+        if metadata is None:
+            return None
+
+        content = self.workspace.resolve(metadata.path).read_text(encoding="utf-8")
+
+        return SkillDetail(
+            name=metadata.name,
+            description=metadata.description,
+            path=metadata.path,
+            content=content,
+        )
 
     def render_prompt(self) -> str:
         skills = self.discover()

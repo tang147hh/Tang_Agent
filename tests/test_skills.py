@@ -58,10 +58,42 @@ def test_discovers_skill_metadata(
 
     assert len(skills) == 1
     assert skills[0].name == "repo-analysis"
-    assert (
-        skills[0].path
-        == "/skills/repo-analysis/SKILL.md"
+    assert skills[0].path == "/skills/repo-analysis/SKILL.md"
+
+
+def test_gets_skill_detail(
+    workspace: Workspace,
+) -> None:
+    write_skill(
+        workspace,
+        body="DETAIL_BODY_LOADED",
     )
+
+    detail = SkillCatalog(workspace).get("repo-analysis")
+
+    assert detail is not None
+    assert detail.name == "repo-analysis"
+    assert detail.description == "分析陌生代码仓库"
+    assert detail.path == "/skills/repo-analysis/SKILL.md"
+    assert "DETAIL_BODY_LOADED" in detail.content
+
+
+def test_get_returns_none_for_missing_skill(
+    workspace: Workspace,
+) -> None:
+    detail = SkillCatalog(workspace).get("missing-skill")
+
+    assert detail is None
+
+
+def test_get_rejects_invalid_skill_name(
+    workspace: Workspace,
+) -> None:
+    with pytest.raises(
+        SkillCatalogError,
+        match="Skill name 不合法",
+    ):
+        SkillCatalog(workspace).get("../secret")
 
 
 def test_prompt_uses_progressive_disclosure(
@@ -112,10 +144,7 @@ def test_agent_can_load_skill_on_demand(
                     {
                         "name": "workspace_read",
                         "args": {
-                            "path": (
-                                "/skills/repo-analysis/"
-                                "SKILL.md"
-                            ),
+                            "path": ("/skills/repo-analysis/" "SKILL.md"),
                             "offset": 0,
                             "limit": 200,
                         },
@@ -148,12 +177,8 @@ def test_agent_can_load_skill_on_demand(
     )
 
     assert any(
-        isinstance(message, ToolMessage)
-        and "SKILL_BODY_LOADED" in str(message.content)
+        isinstance(message, ToolMessage) and "SKILL_BODY_LOADED" in str(message.content)
         for message in result["messages"]
     )
 
-    assert (
-        result["messages"][-1].content
-        == "已加载 repo-analysis Skill"
-    )
+    assert result["messages"][-1].content == "已加载 repo-analysis Skill"

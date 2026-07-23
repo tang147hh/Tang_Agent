@@ -12,6 +12,7 @@ from fastapi import (
     HTTPException,
     Request,
     status,
+    Path as ApiPath,
 )
 from fastapi.sse import (
     EventSourceResponse,
@@ -34,7 +35,10 @@ from app.api.schemas import (
     TaskResponse,
     ThreadCreateRequest,
     ThreadResponse,
+    SkillDetailResponse,
+    SkillSummaryResponse,
 )
+from app.skills import SkillCatalog
 from app.core.conversation_runtime import run_conversation_agent
 from app.core.conversation import (
     ConversationStore,
@@ -54,6 +58,53 @@ router = APIRouter()
 def health() -> dict[str, bool]:
     return {"ok": True}
 
+@router.get(
+    "/api/skills",
+    response_model=list[SkillSummaryResponse],
+)
+def list_skills(
+    request: Request,
+) -> list[SkillSummaryResponse]:
+    workspace: Workspace = request.app.state.workspace
+
+    return [
+        SkillSummaryResponse(
+            name=skill.name,
+            description=skill.description,
+            path=skill.path,
+        )
+        for skill in SkillCatalog(workspace).discover()
+    ]
+
+
+@router.get(
+    "/api/skills/{skill_name}",
+    response_model=SkillDetailResponse,
+)
+def get_skill(
+    skill_name: Annotated[
+        str,
+        ApiPath(
+            pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+        ),
+    ],
+    request: Request,
+) -> SkillDetailResponse:
+    workspace: Workspace = request.app.state.workspace
+    skill = SkillCatalog(workspace).get(skill_name)
+
+    if skill is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="skill not found",
+        )
+
+    return SkillDetailResponse(
+        name=skill.name,
+        description=skill.description,
+        path=skill.path,
+        content=skill.content,
+    )
 
 @router.post(
     "/api/tasks",

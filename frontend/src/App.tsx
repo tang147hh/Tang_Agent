@@ -4,10 +4,12 @@ import {
   createProject,
   createThread,
   getRun,
+  getSkill,
   getThread,
   listMessages,
   listProjects,
   listRuns,
+  listSkills,
   listThreads,
   runEventKinds,
   runEventsUrl,
@@ -19,6 +21,8 @@ import type {
   Run,
   RunEventKind,
   RunEventPayload,
+  SkillDetail,
+  SkillSummary,
   Thread,
 } from './api'
 import { MarkdownContent } from './MarkdownContent'
@@ -160,8 +164,11 @@ function App() {
   const [threads, setThreads] = useState<Thread[]>([])
   const [messages, setMessages] = useState<Message[]>([])
   const [runs, setRuns] = useState<Run[]>([])
+  const [skills, setSkills] = useState<SkillSummary[]>([])
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null)
+  const [selectedSkillName, setSelectedSkillName] = useState<string | null>(null)
+  const [skillDetail, setSkillDetail] = useState<SkillDetail | null>(null)
   const [activeRun, setActiveRun] = useState<Run | null>(null)
   const [streamText, setStreamText] = useState('')
   const [steps, setSteps] = useState<AgentStep[]>([])
@@ -170,6 +177,11 @@ function App() {
   const [notice, setNotice] = useState('准备就绪')
   const [loadingProjects, setLoadingProjects] = useState(true)
   const [loadingConversation, setLoadingConversation] = useState(false)
+  const [loadingSkills, setLoadingSkills] = useState(false)
+  const [loadingSkillDetail, setLoadingSkillDetail] = useState(false)
+  const [skillsLoaded, setSkillsLoaded] = useState(false)
+  const [skillsReloadToken, setSkillsReloadToken] = useState(0)
+  const [skillsError, setSkillsError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [creatingThread, setCreatingThread] = useState(false)
   const [showProjectDialog, setShowProjectDialog] = useState(false)
@@ -197,6 +209,13 @@ function App() {
     if (!query) return threads
     return threads.filter((thread) => thread.title.toLocaleLowerCase().includes(query))
   }, [threads, search])
+  const filteredSkills = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase()
+    if (!query) return skills
+    return skills.filter((skill) => (
+      `${skill.name} ${skill.description}`.toLocaleLowerCase().includes(query)
+    ))
+  }, [search, skills])
   const orderedMessages = useMemo(
     () => [...messages].sort((left, right) => left.sequence - right.sequence),
     [messages],
@@ -344,6 +363,64 @@ function App() {
       .catch((error: unknown) => setNotice(error instanceof Error ? error.message : '会话加载失败'))
     return () => { cancelled = true }
   }, [selectedProjectId])
+
+  useEffect(() => {
+    if (view !== 'skills' || skillsLoaded) return
+
+    let cancelled = false
+    setLoadingSkills(true)
+    setSkillsError('')
+
+    listSkills()
+      .then((items) => {
+        if (cancelled) return
+        setSkills(items)
+        setSelectedSkillName((current) => (
+          items.some((item) => item.name === current)
+            ? current
+            : items[0]?.name ?? null
+        ))
+        setSkillsLoaded(true)
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setSkillsError(error instanceof Error ? error.message : 'Skills 加载失败')
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingSkills(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [skillsLoaded, skillsReloadToken, view])
+
+  useEffect(() => {
+    if (view !== 'skills' || !selectedSkillName) return
+
+    let cancelled = false
+    setSkillDetail(null)
+    setLoadingSkillDetail(true)
+    setSkillsError('')
+
+    getSkill(selectedSkillName)
+      .then((detail) => {
+        if (!cancelled) setSkillDetail(detail)
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setSkillsError(error instanceof Error ? error.message : 'Skill 详情加载失败')
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingSkillDetail(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [selectedSkillName, skillsReloadToken, view])
 
   useEffect(() => {
     closeEventSource()
@@ -511,9 +588,53 @@ function App() {
 
         {view === 'skills' ? (
           <main className="skills-page">
-            <div className="skills-hero"><span className="skills-hero-icon"><Icon name="box" size={26} /></span><div><p className="eyebrow">CAPABILITIES</p><h1>Skills 管理</h1><p>集中查看 Agent 可以按需加载的专业能力。</p></div></div>
-            <div className="skills-toolbar"><div><h2>已安装 Skills</h2><p>Skills API 将在后续课程接入</p></div><button type="button" disabled><Icon name="plus" size={16} />添加 Skill</button></div>
-            <div className="skills-empty"><Icon name="box" size={34} /><h3>Skills 后端尚未接入</h3><p>页面结构已经准备好。完成 <code>GET /api/skills</code> 和详情接口后，这里会展示名称、来源、状态与 SKILL.md 内容。</p></div>
+            <div className="skills-toolbar">
+              <div>
+                <h2>已安装 Skills</h2>
+                <p>{loadingSkills ? '正在加载…' : `${skills.length} 个可用 Skill`}</p>
+              </div>
+            </div>
+
+            {loadingSkills ? (
+              <div className="skills-empty"><span className="loading-ring" /><p>正在加载 Skills…</p></div>
+            ) : skillsError && skills.length === 0 ? (
+              <div className="skills-empty skills-error"><Icon name="box" size={34} /><h3>Skills 加载失败</h3><p>{skillsError}</p><button className="primary-action" type="button" onClick={() => setSkillsReloadToken((value) => value + 1)}>重新加载</button></div>
+            ) : skills.length === 0 ? (
+              <div className="skills-empty"><Icon name="box" size={34} /><h3>还没有安装 Skill</h3></div>
+            ) : (
+              <div className="skills-browser">
+                <nav className="skill-list" aria-label="Skill 列表">
+                  {filteredSkills.map((skill) => (
+                    <button
+                      key={skill.name}
+                      className={`skill-item ${selectedSkillName === skill.name ? 'active' : ''}`}
+                      type="button"
+                      onClick={() => setSelectedSkillName(skill.name)}
+                    >
+                      <span className="skill-item-icon"><Icon name="box" size={17} /></span>
+                      <span className="skill-item-copy"><strong>{skill.name}</strong><small>{skill.description}</small><code>{skill.path}</code></span>
+                      <Icon name="chevron-right" size={16} />
+                    </button>
+                  ))}
+                  {!filteredSkills.length ? <p className="skill-list-empty">没有匹配的 Skill</p> : null}
+                </nav>
+
+                <section className="skill-preview" aria-live="polite">
+                  {loadingSkillDetail ? (
+                    <div className="skill-preview-state"><span className="loading-ring" /><p>正在加载详情…</p></div>
+                  ) : skillsError ? (
+                    <div className="skill-preview-state"><Icon name="box" size={30} /><p>{skillsError}</p><button className="primary-action" type="button" onClick={() => setSkillsReloadToken((value) => value + 1)}>重新加载</button></div>
+                  ) : skillDetail ? (
+                    <>
+                      <header className="skill-preview-header"><span>SKILL.md</span><h2>{skillDetail.name}</h2><p>{skillDetail.description}</p><code>{skillDetail.path}</code></header>
+                      <div className="skill-document"><MarkdownContent content={skillDetail.content} /></div>
+                    </>
+                  ) : (
+                    <div className="skill-preview-state"><p>选择一个 Skill 查看详情</p></div>
+                  )}
+                </section>
+              </div>
+            )}
           </main>
         ) : (
           <div className={`chat-layout ${showRunPanel ? '' : 'panel-hidden'}`}>
