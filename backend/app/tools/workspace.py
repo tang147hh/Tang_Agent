@@ -4,6 +4,7 @@ from dataclasses import asdict
 
 from langchain_core.tools import BaseTool, StructuredTool
 
+from app.backends.command_runner import CommandPolicyError
 from app.backends.task_scoped import TaskScopedBackend
 
 
@@ -120,11 +121,22 @@ def build_workspace_tools(
         ) -> dict[str, object]:
             """在工作区中执行受控的参数数组命令。"""
 
-            result = backend.run_command(
-                argv,
-                cwd=cwd,
-                timeout=timeout,
-            )
+            try:
+                result = backend.run_command(
+                    argv,
+                    cwd=cwd,
+                    timeout=timeout,
+                )
+            except CommandPolicyError as exc:
+                return {
+                    "status": "rejected",
+                    "error": str(exc),
+                    "recoverable": True,
+                    "hint": (
+                        "命令未执行。请改用符合策略的命令；"
+                        "验证文件内容时优先使用 workspace_read。"
+                    ),
+                }
 
             return asdict(result)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,9 @@ def test_non_coding_tasks_are_read_only() -> None:
 def backend(tmp_path: Path) -> LocalShellBackend:
     workspace = Workspace(tmp_path / "workspace")
     workspace.ensure_layout()
+    runtime_bin = workspace.root / "runtimes" / "python" / "bin"
+    runtime_bin.mkdir(parents=True)
+    (runtime_bin / "python").symlink_to(sys.executable)
     return LocalShellBackend(workspace)
 
 

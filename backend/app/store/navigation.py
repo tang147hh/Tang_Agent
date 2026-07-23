@@ -17,6 +17,7 @@ from app.core.conversation import (
     ThreadStatus,
     RunEventSnapshot,
 )
+from app.core.task_intent import TaskKind
 
 
 class SQLiteProjectThreadStore:
@@ -86,6 +87,7 @@ class SQLiteProjectThreadStore:
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY,
                     thread_id TEXT NOT NULL,
+                    task_kind TEXT NOT NULL,
                     status TEXT NOT NULL,
                     error TEXT,
                     created_at TEXT NOT NULL,
@@ -95,6 +97,18 @@ class SQLiteProjectThreadStore:
                         ON DELETE CASCADE
                 )
                 """)
+
+            run_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(runs)"
+                ).fetchall()
+            }
+            if "task_kind" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN task_kind TEXT "
+                    "NOT NULL DEFAULT 'qa'"
+                )
 
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
@@ -328,6 +342,7 @@ class SQLiteProjectThreadStore:
         *,
         thread_id: str,
         content: str,
+        task_kind: TaskKind = TaskKind.QA,
     ) -> tuple[RunSnapshot, MessageSnapshot]:
         normalized_content = content.strip()
 
@@ -363,16 +378,18 @@ class SQLiteProjectThreadStore:
                     INSERT INTO runs (
                         run_id,
                         thread_id,
+                        task_kind,
                         status,
                         error,
                         created_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, NULL, ?, ?)
+                    VALUES (?, ?, ?, ?, NULL, ?, ?)
                     """,
                     (
                         run_id,
                         thread_id,
+                        task_kind.value,
                         RunStatus.PENDING.value,
                         now,
                         now,
@@ -460,6 +477,7 @@ class SQLiteProjectThreadStore:
         self,
         *,
         thread_id: str,
+        task_kind: TaskKind = TaskKind.QA,
     ) -> RunSnapshot:
         run_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
@@ -483,16 +501,18 @@ class SQLiteProjectThreadStore:
                     INSERT INTO runs (
                         run_id,
                         thread_id,
+                        task_kind,
                         status,
                         error,
                         created_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, NULL, ?, ?)
+                    VALUES (?, ?, ?, ?, NULL, ?, ?)
                     """,
                     (
                         run_id,
                         thread_id,
+                        task_kind.value,
                         RunStatus.PENDING.value,
                         now,
                         now,
@@ -1049,6 +1069,7 @@ class SQLiteProjectThreadStore:
         return RunSnapshot(
             run_id=str(row["run_id"]),
             thread_id=str(row["thread_id"]),
+            task_kind=TaskKind(row["task_kind"]),
             status=RunStatus(row["status"]),
             error=row["error"],
             created_at=datetime.fromisoformat(row["created_at"]),

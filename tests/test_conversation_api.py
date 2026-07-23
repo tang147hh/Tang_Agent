@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.app import create_app
 from app.backends.workspace import Workspace
 from app.core.conversation import MessageRole
+from app.core.task_intent import TaskKind
 from app.core.task_runtime import TaskRegistry
 from app.store import SQLiteProjectThreadStore
 from langchain_core.messages import (
@@ -264,6 +265,7 @@ def test_starts_run_with_user_message(
         payload = created.json()
 
         assert payload["run"]["status"] == ("pending")
+        assert payload["run"]["task_kind"] == "coding"
         assert payload["message"]["role"] == ("user")
         assert payload["message"]["content"] == ("继续增加测试")
         assert payload["message"]["run_id"] == (payload["run"]["run_id"])
@@ -277,6 +279,7 @@ def test_starts_run_with_user_message(
 
     assert run_response.status_code == 200
     assert run_response.json()["status"] == "completed"
+    assert run_response.json()["task_kind"] == "coding"
 
     assert [message["content"] for message in messages] == [
         "分析项目结构",
@@ -291,13 +294,132 @@ def test_starts_run_with_user_message(
 
     assert agent.received_config == {
         "configurable": {
-            "thread_id": thread.thread_id,
+            "thread_id": run_id,
         }
     }
 
-    prompt = agent.received_input["messages"][0]["content"]
+    assert [
+        message["role"]
+        for message in agent.received_input["messages"]
+    ] == ["user", "assistant", "user"]
+    prompt = agent.received_input["messages"][-1]["content"]
     assert "/projects/demo" in prompt
     assert "继续增加测试" in prompt
+
+
+def test_mode_switch_uses_run_checkpoint_and_sqlite_history(
+    tmp_path: Path,
+) -> None:
+    captured_kinds: list[TaskKind] = []
+    agents: list[SuccessfulConversationAgent] = []
+
+    def agent_factory(task_kind: TaskKind):
+        captured_kinds.append(task_kind)
+        agent = SuccessfulConversationAgent()
+        agents.append(agent)
+        return agent
+
+    app, thread, _ = _conversation_app(
+        tmp_path,
+        agent_factory=agent_factory,
+    )
+
+    with TestClient(app) as client:
+        qa_response = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={
+                "content": "这个项目采用了什么结构？",
+                "task_kind": "qa",
+            },
+        )
+        coding_response = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={
+                "content": "请创建一个说明文件",
+                "task_kind": "coding",
+            },
+        )
+
+    assert qa_response.status_code == 202
+    assert coding_response.status_code == 202
+    assert captured_kinds == [TaskKind.QA, TaskKind.CODING]
+
+    qa_run_id = qa_response.json()["run"]["run_id"]
+    coding_run_id = coding_response.json()["run"]["run_id"]
+    checkpoint_ids = [
+        agent.received_config["configurable"]["thread_id"]
+        for agent in agents
+    ]
+
+    assert checkpoint_ids == [qa_run_id, coding_run_id]
+    assert qa_run_id != coding_run_id
+
+    coding_messages = agents[1].received_input["messages"]
+    assert [message["role"] for message in coding_messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert coding_messages[-3]["content"] == (
+        "这个项目采用了什么结构？"
+    )
+    assert coding_messages[-2]["content"] == "任务已经完成"
+    assert "/projects/demo" in coding_messages[-1]["content"]
+    assert "请创建一个说明文件" in (
+        coding_messages[-1]["content"]
+    )
+
+
+def test_explicit_task_kind_controls_conversation_agent(
+    tmp_path: Path,
+) -> None:
+    captured_kinds: list[TaskKind] = []
+    agent = SuccessfulConversationAgent()
+
+    def agent_factory(task_kind: TaskKind):
+        captured_kinds.append(task_kind)
+        return agent
+
+    app, thread, _ = _conversation_app(
+        tmp_path,
+        agent_factory=agent_factory,
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={
+                "content": "请分析项目结构",
+                "task_kind": "coding",
+            },
+        )
+
+        assert created.status_code == 202
+        run_id = created.json()["run"]["run_id"]
+        restored = client.get(f"/api/runs/{run_id}")
+
+    assert created.json()["run"]["task_kind"] == "coding"
+    assert restored.json()["task_kind"] == "coding"
+    assert captured_kinds == [TaskKind.CODING]
+
+
+def test_rejects_unknown_task_kind(
+    tmp_path: Path,
+) -> None:
+    app, thread, _ = _conversation_app(tmp_path)
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={
+                "content": "处理项目",
+                "task_kind": "unknown",
+            },
+        )
+
+    assert response.status_code == 422
 
 
 def test_streams_conversation_run_events(
@@ -337,6 +459,20 @@ def test_streams_conversation_run_events(
         "running",
         "token",
         "completed",
+    ]
+
+    lifecycle_payloads = [
+        json.loads(line.removeprefix("data: "))
+        for block in body.split("\n\n")
+        if "event: created" in block
+        or "event: running" in block
+        for line in block.splitlines()
+        if line.startswith("data: ")
+    ]
+
+    assert [payload["task_kind"] for payload in lifecycle_payloads] == [
+        "analysis",
+        "analysis",
     ]
 
     token_payloads = [

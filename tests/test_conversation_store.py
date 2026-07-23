@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from app.core.conversation import (
     RunStatus,
     ThreadStatus,
 )
+from app.core.task_intent import TaskKind
 from app.store import SQLiteProjectThreadStore
 
 
@@ -26,6 +28,39 @@ def _create_thread(
     )
 
 
+def test_migrates_existing_runs_to_read_only_mode(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("""
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        connection.execute(
+            "INSERT INTO runs VALUES (?, ?, ?, NULL, ?, ?)",
+            (
+                "legacy-run",
+                "legacy-thread",
+                RunStatus.COMPLETED.value,
+                "2026-07-22T00:00:00+00:00",
+                "2026-07-22T00:00:01+00:00",
+            ),
+        )
+
+    store = SQLiteProjectThreadStore(database)
+    migrated = store.get_run("legacy-run")
+
+    assert migrated is not None
+    assert migrated.task_kind is TaskKind.QA
+
+
 def test_persists_messages_and_runs(
     tmp_path: Path,
 ) -> None:
@@ -33,7 +68,10 @@ def test_persists_messages_and_runs(
     store = SQLiteProjectThreadStore(database)
     thread = _create_thread(store)
 
-    run = store.create_run(thread_id=thread.thread_id)
+    run = store.create_run(
+        thread_id=thread.thread_id,
+        task_kind=TaskKind.PLANNING,
+    )
 
     user_message = store.append_message(
         thread_id=thread.thread_id,
@@ -74,6 +112,7 @@ def test_persists_messages_and_runs(
 
     assert len(runs) == 1
     assert runs[0].status is RunStatus.COMPLETED
+    assert runs[0].task_kind is TaskKind.PLANNING
 
     assert restored_thread is not None
     assert restored_thread.status is ThreadStatus.IDLE
@@ -165,9 +204,11 @@ def test_atomically_starts_run_with_user_message(
     run, message = store.start_run_with_message(
         thread_id=thread.thread_id,
         content="  分析项目结构  ",
+        task_kind=TaskKind.ANALYSIS,
     )
 
     assert run.status is RunStatus.PENDING
+    assert run.task_kind is TaskKind.ANALYSIS
     assert message.role is MessageRole.USER
     assert message.content == "分析项目结构"
     assert message.run_id == run.run_id

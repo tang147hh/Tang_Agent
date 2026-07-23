@@ -14,6 +14,15 @@ ALLOWED_COMMANDS = {
     "pytest",
     "ruff",
 }
+OPTIONAL_COMMANDS = {
+    "gh",
+}
+
+COMMAND_ALIASES = {
+    "python3": "python",
+}
+
+PYTHON_RUNTIME_PATH = "runtimes/python/bin/python"
 
 SAFE_ENVIRONMENT_KEYS = {
     "PATH",
@@ -76,8 +85,23 @@ def _decode_timeout_output(value: str | bytes | None) -> str:
 
 
 class CommandRunner:
-    def __init__(self, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        workspace: Workspace,
+        *,
+        allowed_commands: set[str] | frozenset[str] | None = None,
+    ) -> None:
         self.workspace = workspace
+        requested_commands = set(allowed_commands or ALLOWED_COMMANDS)
+        supported_commands = ALLOWED_COMMANDS | OPTIONAL_COMMANDS
+
+        if not requested_commands.issubset(supported_commands):
+            unsupported = sorted(requested_commands - supported_commands)
+            raise CommandPolicyError(
+                "执行器包含不受支持的命令：" + ", ".join(unsupported)
+            )
+
+        self.allowed_commands = frozenset(requested_commands)
 
     def run(
         self,
@@ -111,12 +135,7 @@ class CommandRunner:
         if not cwd_path.is_dir():
             raise CommandPolicyError(f"工作目录不是目录：{cwd}")
 
-        executable = shutil.which(normalized_argv[0])
-
-        if executable is None:
-            raise CommandPolicyError(
-                f"命令不可用：{normalized_argv[0]}"
-            )
+        executable = self._resolve_executable(normalized_argv[0])
 
         prepared_argv = [
             executable,
@@ -184,9 +203,14 @@ class CommandRunner:
         if not normalized:
             raise CommandPolicyError("命令不能为空")
 
+        normalized[0] = COMMAND_ALIASES.get(
+            normalized[0],
+            normalized[0],
+        )
+
         command = normalized[0]
 
-        if command not in ALLOWED_COMMANDS:
+        if command not in self.allowed_commands:
             raise CommandPolicyError(
                 f"命令不在白名单中：{command}"
             )
@@ -219,6 +243,25 @@ class CommandRunner:
 
         return normalized
 
+    def _resolve_executable(self, command: str) -> str:
+        if command == "python":
+            runtime = self.workspace.root / PYTHON_RUNTIME_PATH
+
+            if not runtime.is_file() or not os.access(runtime, os.X_OK):
+                raise CommandPolicyError(
+                    "Agent Python Runtime 不可用："
+                    "/runtimes/python/bin/python"
+                )
+
+            return str(runtime)
+
+        executable = shutil.which(command)
+
+        if executable is None:
+            raise CommandPolicyError(f"命令不可用：{command}")
+
+        return executable
+
     def _validate_command_specific_policy(
         self,
         argv: list[str],
@@ -230,6 +273,10 @@ class CommandRunner:
             raise CommandPolicyError(
                 "禁止使用 python -c 执行任意内联代码"
             )
+
+        if command == "gh":
+            self._validate_github_cli_policy(argv)
+            return
 
         if command != "git":
             return
@@ -256,6 +303,38 @@ class CommandRunner:
                 "禁止修改全局或系统 Git 配置"
             )
 
+    def _validate_github_cli_policy(
+        self,
+        argv: list[str],
+    ) -> None:
+        if argv == [
+            "gh",
+            "auth",
+            "status",
+            "--hostname",
+            "github.com",
+        ]:
+            return
+
+        expected_flags = [
+            "--repo",
+            "--base",
+            "--head",
+            "--title",
+            "--body",
+        ]
+
+        if (
+            len(argv) == 13
+            and argv[1:3] == ["pr", "create"]
+            and argv[3::2] == expected_flags
+        ):
+            return
+
+        raise CommandPolicyError(
+            "GitHub CLI 只允许认证检查和固定格式的 PR 创建"
+        )
+
     def _prepare_argument(self, argument: str) -> str:
         """把虚拟绝对路径转换成真实工作区路径。"""
 
@@ -281,5 +360,7 @@ class CommandRunner:
         environment["PYTHONUTF8"] = "1"
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GH_PROMPT_DISABLED"] = "1"
+        environment["GH_NO_UPDATE_NOTIFIER"] = "1"
 
         return environment

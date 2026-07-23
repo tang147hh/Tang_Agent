@@ -1,16 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import {
+  checkoutRepositoryBranch,
+  cloneRepository,
+  commitRepository,
   createProject,
+  createRepositoryBranch,
+  createRepositoryPullRequest,
   createThread,
+  fetchRepository,
   getRun,
   getSkill,
   getThread,
   listMessages,
   listProjects,
+  listRepositories,
   listRuns,
   listSkills,
   listThreads,
+  pushRepository,
   runEventKinds,
   runEventsUrl,
   startRun,
@@ -18,17 +26,20 @@ import {
 import type {
   Message,
   Project,
+  PullRequest,
+  Repository,
   Run,
   RunEventKind,
   RunEventPayload,
   SkillDetail,
   SkillSummary,
+  TaskKind,
   Thread,
 } from './api'
 import { MarkdownContent } from './MarkdownContent'
 import './App.css'
 
-type View = 'chat' | 'skills'
+type View = 'chat' | 'skills' | 'repositories'
 type IconName =
   | 'arrow-left'
   | 'book'
@@ -37,15 +48,22 @@ type IconName =
   | 'chevron-down'
   | 'chevron-right'
   | 'clock'
+  | 'code'
   | 'folder'
+  | 'git-branch'
+  | 'git-commit'
   | 'history'
   | 'message'
   | 'plus'
+  | 'question'
+  | 'refresh'
+  | 'repository'
   | 'search'
   | 'send'
   | 'settings'
   | 'sparkles'
   | 'terminal'
+  | 'upload'
   | 'user'
 
 interface AgentStep {
@@ -59,11 +77,23 @@ interface AgentStep {
   toolCallId?: string
 }
 
+type PendingRepositoryAction =
+  | { kind: 'commit'; message: string }
+  | { kind: 'push'; branch: string }
+  | { kind: 'pull-request'; title: string; body: string; base: string; head: string }
+
 const quickPrompts = [
   { icon: 'terminal' as const, label: '分析这个项目', prompt: '请分析当前项目结构，并说明主要模块的职责。' },
   { icon: 'folder' as const, label: '梳理目录结构', prompt: '请梳理当前项目的目录结构和关键代码入口。' },
   { icon: 'sparkles' as const, label: '给出优化建议', prompt: '请检查当前项目并给出最值得优先处理的优化建议。' },
   { icon: 'check' as const, label: '检查项目状态', prompt: '请检查当前项目状态、测试情况和未完成事项。' },
+]
+
+const taskKinds: Array<{ value: TaskKind; icon: IconName }> = [
+  { value: 'coding', icon: 'code' },
+  { value: 'analysis', icon: 'search' },
+  { value: 'planning', icon: 'message' },
+  { value: 'qa', icon: 'question' },
 ]
 
 const stepCopy: Record<RunEventKind, { title: string; detail: string }> = {
@@ -76,6 +106,22 @@ const stepCopy: Record<RunEventKind, { title: string; detail: string }> = {
   failed: { title: '执行失败', detail: '任务未能完成，请查看错误信息' },
 }
 
+const implementPlanPrompt = '请按照上面的方案开始实施，并在完成后运行相关测试。'
+
+function actionablePlanningRunId(runs: Run[]): string | null {
+  const latestPlanningIndex = runs.findLastIndex((run) => (
+    run.task_kind === 'planning' && run.status === 'completed'
+  ))
+
+  if (latestPlanningIndex < 0) return null
+
+  const implementationStarted = runs
+    .slice(latestPlanningIndex + 1)
+    .some((run) => run.task_kind === 'coding')
+
+  return implementationStarted ? null : runs[latestPlanningIndex].run_id
+}
+
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
     'arrow-left': <><path d="m15 18-6-6 6-6" /><path d="M9 12h12" /></>,
@@ -85,15 +131,22 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     'chevron-down': <path d="m6 9 6 6 6-6" />,
     'chevron-right': <path d="m9 18 6-6-6-6" />,
     clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
+    code: <><path d="m8 9-3 3 3 3" /><path d="m16 9 3 3-3 3" /><path d="m14 5-4 14" /></>,
     folder: <><path d="M3 6h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" /><path d="M3 10h18" /></>,
+    'git-branch': <><circle cx="6" cy="5" r="2" /><circle cx="18" cy="6" r="2" /><circle cx="6" cy="19" r="2" /><path d="M6 7v10" /><path d="M8 7c5 0 3 6 8 6h2" /><path d="M18 8v5" /></>,
+    'git-commit': <><circle cx="12" cy="12" r="3" /><path d="M3 12h6" /><path d="M15 12h6" /></>,
     history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /><path d="M12 7v5l3 2" /></>,
     message: <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4Z" />,
     plus: <><path d="M12 5v14" /><path d="M5 12h14" /></>,
+    question: <><circle cx="12" cy="12" r="9" /><path d="M9.8 9a2.4 2.4 0 1 1 3.1 2.3c-.9.3-.9 1.1-.9 1.7" /><path d="M12 17h.01" /></>,
+    refresh: <><path d="M20 6v5h-5" /><path d="M4 18v-5h5" /><path d="M18.5 9A7 7 0 0 0 6 6.5L4 11" /><path d="M5.5 15A7 7 0 0 0 18 17.5l2-4.5" /></>,
+    repository: <><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v18H6.5A2.5 2.5 0 0 0 4 22Z" /><path d="M4 4.5v15" /><path d="M9 7h6" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
     send: <><path d="m22 2-7 20-4-9-9-4Z" /><path d="M22 2 11 13" /></>,
     settings: <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z" /></>,
     sparkles: <><path d="m12 3-1 3-3 1 3 1 1 3 1-3 3-1-3-1Z" /><path d="m19 13-1 2-2 1 2 1 1 2 1-2 2-1-2-1Z" /><path d="m5 14-.7 1.8L2.5 16.5l1.8.7L5 19l.7-1.8 1.8-.7-1.8-.7Z" /></>,
     terminal: <><path d="m4 17 6-6-6-6" /><path d="M12 19h8" /></>,
+    upload: <><path d="M12 16V3" /><path d="m7 8 5-5 5 5" /><path d="M5 14v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" /></>,
     user: <><circle cx="12" cy="8" r="4" /><path d="M4 21a8 8 0 0 1 16 0" /></>,
   }
 
@@ -158,6 +211,402 @@ function stepPresentation(kind: RunEventKind, payload: RunEventPayload) {
   }
 }
 
+function RepositoriesPage({ search }: { search: string }) {
+  const [repositories, setRepositories] = useState<Repository[]>([])
+  const [selectedName, setSelectedName] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState('')
+  const [branchName, setBranchName] = useState('')
+  const [showCloneDialog, setShowCloneDialog] = useState(false)
+  const [cloneUrl, setCloneUrl] = useState('')
+  const [cloneError, setCloneError] = useState('')
+  const [commitMessage, setCommitMessage] = useState('')
+  const [pullRequestTitle, setPullRequestTitle] = useState('')
+  const [pullRequestBody, setPullRequestBody] = useState('')
+  const [pullRequestBase, setPullRequestBase] = useState('main')
+  const [createdPullRequest, setCreatedPullRequest] = useState<PullRequest | null>(null)
+  const [pendingAction, setPendingAction] = useState<PendingRepositoryAction | null>(null)
+
+  const loadRepositories = useCallback(async () => {
+    setLoading(true)
+    setError('')
+
+    try {
+      const items = await listRepositories()
+      setRepositories(items)
+      setSelectedName((current) => (
+        items.some((item) => item.name === current)
+          ? current
+          : items[0]?.name ?? null
+      ))
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : '仓库加载失败')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadRepositories()
+  }, [loadRepositories])
+
+  const selectedRepository = repositories.find(
+    (repository) => repository.name === selectedName,
+  ) ?? null
+  const filteredRepositories = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase()
+
+    if (!query) return repositories
+
+    return repositories.filter((repository) => (
+      `${repository.name} ${repository.path} ${repository.remote_url}`
+        .toLocaleLowerCase()
+        .includes(query)
+    ))
+  }, [repositories, search])
+
+  function updateRepository(snapshot: Repository) {
+    setRepositories((current) => {
+      const exists = current.some((item) => item.name === snapshot.name)
+      const updated = exists
+        ? current.map((item) => item.name === snapshot.name ? snapshot : item)
+        : [...current, snapshot]
+
+      return [...updated].sort((left, right) => left.name.localeCompare(right.name))
+    })
+    setSelectedName(snapshot.name)
+  }
+
+  async function handleFetch() {
+    if (!selectedRepository || busy) return
+    setBusy('fetch')
+    setError('')
+    setNotice('')
+
+    try {
+      updateRepository(await fetchRepository(selectedRepository.name))
+      setNotice('已从 origin 获取最新引用')
+    } catch (fetchError) {
+      setError(fetchError instanceof Error ? fetchError.message : 'Fetch 失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function handleCreateBranch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const normalizedBranch = branchName.trim()
+
+    if (!selectedRepository || !normalizedBranch || busy) return
+    setBusy('branch')
+    setError('')
+    setNotice('')
+
+    try {
+      updateRepository(await createRepositoryBranch(
+        selectedRepository.name,
+        normalizedBranch,
+      ))
+      setBranchName('')
+      setNotice(`已创建并切换到 ${normalizedBranch}`)
+    } catch (branchError) {
+      setError(branchError instanceof Error ? branchError.message : '创建分支失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function handleCheckout(branch: string) {
+    if (!selectedRepository || branch === selectedRepository.current_branch || busy) return
+    setBusy(`checkout:${branch}`)
+    setError('')
+    setNotice('')
+
+    try {
+      updateRepository(await checkoutRepositoryBranch(
+        selectedRepository.name,
+        branch,
+      ))
+      setNotice(`已切换到 ${branch}`)
+    } catch (checkoutError) {
+      setError(checkoutError instanceof Error ? checkoutError.message : '切换分支失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function handleClone(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const normalizedUrl = cloneUrl.trim()
+
+    if (!normalizedUrl || busy) return
+    setBusy('clone')
+    setCloneError('')
+
+    try {
+      const snapshot = await cloneRepository(normalizedUrl)
+      updateRepository(snapshot)
+      setCloneUrl('')
+      setShowCloneDialog(false)
+      setNotice(`已克隆 ${snapshot.name}`)
+    } catch (cloneFailure) {
+      setCloneError(cloneFailure instanceof Error ? cloneFailure.message : '克隆失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  function requestCommit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const message = commitMessage.trim()
+
+    if (!selectedRepository || !selectedRepository.dirty || !message || busy) return
+    setPendingAction({ kind: 'commit', message })
+  }
+
+  function requestPush() {
+    if (!selectedRepository || selectedRepository.dirty || busy) return
+    setPendingAction({
+      kind: 'push',
+      branch: selectedRepository.current_branch,
+    })
+  }
+
+  function requestPullRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const title = pullRequestTitle.trim()
+    const base = pullRequestBase.trim()
+
+    if (!selectedRepository || selectedRepository.dirty || !title || !base || busy) return
+    setPendingAction({
+      kind: 'pull-request',
+      title,
+      body: pullRequestBody.trim(),
+      base,
+      head: selectedRepository.current_branch,
+    })
+  }
+
+  async function executePendingAction() {
+    if (!selectedRepository || !pendingAction || busy) return
+    const action = pendingAction
+    setBusy(action.kind)
+    setError('')
+    setNotice('')
+
+    try {
+      if (action.kind === 'commit') {
+        const result = await commitRepository(
+          selectedRepository.name,
+          action.message,
+        )
+        updateRepository(result.repository)
+        setCommitMessage('')
+        setNotice(`已提交 ${result.sha.slice(0, 8)} · ${result.subject}`)
+      } else if (action.kind === 'push') {
+        const result = await pushRepository(selectedRepository.name)
+        updateRepository(result.repository)
+        setNotice(`已推送 origin/${result.branch}`)
+      } else {
+        const result = await createRepositoryPullRequest(
+          selectedRepository.name,
+          {
+            title: action.title,
+            body: action.body,
+            base: action.base,
+          },
+        )
+        setCreatedPullRequest(result)
+        setNotice(`Pull Request #${result.number} 已创建`)
+      }
+
+      setPendingAction(null)
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : '仓库操作失败')
+      setPendingAction(null)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const protectedBranch = selectedRepository
+    ? ['main', 'master'].includes(selectedRepository.current_branch)
+    : false
+  const confirmation = pendingAction?.kind === 'commit'
+    ? {
+        title: '确认创建 Commit',
+        detail: `将暂存 ${selectedRepository?.name ?? ''} 的全部修改，并提交为“${pendingAction.message}”。`,
+        action: '确认提交',
+        icon: 'git-commit' as const,
+      }
+    : pendingAction?.kind === 'push'
+      ? {
+          title: '确认推送分支',
+          detail: `将 ${pendingAction.branch} 推送到固定远程 origin。`,
+          action: '确认推送',
+          icon: 'upload' as const,
+        }
+      : pendingAction?.kind === 'pull-request'
+        ? {
+            title: '确认创建 Pull Request',
+            detail: `将在 GitHub 上创建 ${pendingAction.head} → ${pendingAction.base} 的 Pull Request。`,
+            action: '确认创建',
+            icon: 'git-branch' as const,
+          }
+        : null
+
+  return (
+    <main className="repositories-page">
+      <div className="repositories-toolbar">
+        <div>
+          <h2>Repositories</h2>
+          <span>{loading ? '正在扫描…' : `${repositories.length} 个本地 Git 仓库`}</span>
+        </div>
+        <button className="primary-action" type="button" onClick={() => { setCloneError(''); setShowCloneDialog(true) }}>
+          <Icon name="plus" size={17} />克隆仓库
+        </button>
+      </div>
+
+      {loading ? (
+        <div className="repositories-state"><span className="loading-ring" /><p>正在扫描 /projects…</p></div>
+      ) : error && repositories.length === 0 ? (
+        <div className="repositories-state"><Icon name="repository" size={32} /><h3>仓库加载失败</h3><p>{error}</p><button className="primary-action" type="button" onClick={() => void loadRepositories()}>重新加载</button></div>
+      ) : repositories.length === 0 ? (
+        <div className="repositories-state"><Icon name="repository" size={32} /><h3>还没有本地 Git 仓库</h3><button className="primary-action" type="button" onClick={() => setShowCloneDialog(true)}>克隆仓库</button></div>
+      ) : (
+        <div className="repositories-browser">
+          <nav className="repository-list" aria-label="仓库列表">
+            {filteredRepositories.map((repository) => (
+              <button
+                key={repository.name}
+                className={`repository-item ${selectedName === repository.name ? 'active' : ''}`}
+                type="button"
+                onClick={() => { setSelectedName(repository.name); setError(''); setNotice(''); setCreatedPullRequest(null) }}
+              >
+                <span className="repository-item-icon"><Icon name="repository" size={17} /></span>
+                <span className="repository-item-copy">
+                  <strong>{repository.name}</strong>
+                  <small><Icon name="git-branch" size={13} />{repository.current_branch}</small>
+                  <code>{repository.path}</code>
+                </span>
+                <span className={`repository-dirty-dot ${repository.dirty ? 'dirty' : ''}`} title={repository.dirty ? '有未提交修改' : '工作区干净'} />
+              </button>
+            ))}
+            {!filteredRepositories.length ? <p className="repository-list-empty">没有匹配的仓库</p> : null}
+          </nav>
+
+          {selectedRepository ? (
+            <section className="repository-detail">
+              <header className="repository-detail-header">
+                <div className="repository-title-row">
+                  <span className="repository-detail-icon"><Icon name="repository" size={20} /></span>
+                  <div><h2>{selectedRepository.name}</h2><code>{selectedRepository.path}</code></div>
+                </div>
+                <button className="secondary-action" type="button" disabled={Boolean(busy)} onClick={() => void handleFetch()}>
+                  <Icon name="refresh" size={16} />{busy === 'fetch' ? '正在 Fetch…' : 'Fetch'}
+                </button>
+              </header>
+
+              <div className="repository-facts">
+                <div><span>当前分支</span><strong><Icon name="git-branch" size={15} />{selectedRepository.current_branch}</strong></div>
+                <div><span>工作区状态</span><strong className={selectedRepository.dirty ? 'dirty-text' : 'clean-text'}>{selectedRepository.dirty ? '有未提交修改' : '干净'}</strong></div>
+                <div className="repository-remote"><span>Origin</span>{selectedRepository.remote_url ? <code title={selectedRepository.remote_url}>{selectedRepository.remote_url}</code> : <em>未配置</em>}</div>
+              </div>
+
+              {error ? <div className="repository-alert error" role="alert">{error}</div> : null}
+              {notice ? <div className="repository-alert success" role="status">{notice}</div> : null}
+
+              <section className="repository-workflow">
+                <div className="repository-workflow-heading"><h3>交付工作流</h3><span>{selectedRepository.current_branch}</span></div>
+
+                <div className="workflow-step">
+                  <span className="workflow-step-number">1</span>
+                  <div className="workflow-step-content">
+                    <div className="workflow-step-title"><strong>Commit</strong><span>{selectedRepository.dirty ? '有待提交修改' : '工作区干净'}</span></div>
+                    <form className="repository-commit-form" onSubmit={requestCommit}>
+                      <label htmlFor="commit-message">提交信息</label>
+                      <div><input id="commit-message" value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} placeholder="feat: implement repository workflow" maxLength={200} /><button className="primary-action" type="submit" disabled={!selectedRepository.dirty || !commitMessage.trim() || Boolean(busy)}><Icon name="git-commit" size={16} />Commit</button></div>
+                    </form>
+                  </div>
+                </div>
+
+                <div className="workflow-step">
+                  <span className="workflow-step-number">2</span>
+                  <div className="workflow-step-content">
+                    <div className="workflow-step-title"><strong>Push</strong><span>origin/{selectedRepository.current_branch}</span></div>
+                    <button className="secondary-action repository-push-action" type="button" disabled={selectedRepository.dirty || protectedBranch || !selectedRepository.remote_url || Boolean(busy)} onClick={requestPush}><Icon name="upload" size={16} />{busy === 'push' ? '正在推送…' : protectedBranch ? '请先切换功能分支' : 'Push 当前分支'}</button>
+                  </div>
+                </div>
+
+                <div className="workflow-step">
+                  <span className="workflow-step-number">3</span>
+                  <div className="workflow-step-content">
+                    <div className="workflow-step-title"><strong>Pull Request</strong><span>{selectedRepository.current_branch} → {pullRequestBase || 'base'}</span></div>
+                    <form className="pull-request-form" onSubmit={requestPullRequest}>
+                      <div className="pull-request-fields"><label>PR 标题<input value={pullRequestTitle} onChange={(event) => setPullRequestTitle(event.target.value)} placeholder="feat: complete repository workflow" maxLength={256} /></label><label>目标分支<input value={pullRequestBase} onChange={(event) => setPullRequestBase(event.target.value)} placeholder="main" maxLength={255} /></label></div>
+                      <label>PR 正文<textarea value={pullRequestBody} onChange={(event) => setPullRequestBody(event.target.value)} placeholder="Summary and verification" maxLength={10000} rows={4} /></label>
+                      <button className="primary-action" type="submit" disabled={selectedRepository.dirty || !pullRequestTitle.trim() || !pullRequestBase.trim() || selectedRepository.current_branch === pullRequestBase.trim() || Boolean(busy)}><Icon name="git-branch" size={16} />{busy === 'pull-request' ? '正在创建…' : '创建 Pull Request'}</button>
+                    </form>
+                    {createdPullRequest ? <a className="pull-request-result" href={createdPullRequest.url} target="_blank" rel="noreferrer"><span><strong>Pull Request #{createdPullRequest.number}</strong><small>{createdPullRequest.head} → {createdPullRequest.base}</small></span><Icon name="chevron-right" size={16} /></a> : null}
+                  </div>
+                </div>
+              </section>
+
+              <section className="branch-section">
+                <div className="branch-section-heading"><div><h3>本地分支</h3><span>{selectedRepository.branches.length} 个分支</span></div></div>
+                <form className="branch-create-form" onSubmit={(event) => void handleCreateBranch(event)}>
+                  <label htmlFor="new-branch-name">新分支名称</label>
+                  <div><input id="new-branch-name" value={branchName} onChange={(event) => setBranchName(event.target.value)} placeholder="feature/course" maxLength={255} /><button className="primary-action" type="submit" disabled={!branchName.trim() || Boolean(busy)}><Icon name="plus" size={16} />{busy === 'branch' ? '正在创建…' : '创建并切换'}</button></div>
+                </form>
+                <div className="branch-list">
+                  {selectedRepository.branches.map((branch) => {
+                    const active = branch === selectedRepository.current_branch
+                    const checkingOut = busy === `checkout:${branch}`
+
+                    return (
+                      <div className={`branch-row ${active ? 'active' : ''}`} key={branch}>
+                        <span className="branch-icon"><Icon name="git-branch" size={16} /></span>
+                        <code>{branch}</code>
+                        {active ? <span className="current-branch"><Icon name="check" size={14} />当前</span> : <button type="button" disabled={Boolean(busy)} onClick={() => void handleCheckout(branch)}>{checkingOut ? '切换中…' : '切换'}</button>}
+                      </div>
+                    )
+                  })}
+                </div>
+              </section>
+            </section>
+          ) : <div className="repository-detail-placeholder">选择一个仓库查看详情</div>}
+        </div>
+      )}
+
+      {showCloneDialog ? (
+        <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && busy !== 'clone') setShowCloneDialog(false) }}>
+          <form className="project-dialog repository-dialog" onSubmit={(event) => void handleClone(event)}>
+            <div className="dialog-icon"><Icon name="repository" /></div>
+            <h2>克隆 GitHub 仓库</h2>
+            <p>仓库将保存到 Agent 工作区的 <code>/projects</code> 目录。</p>
+            <label>GitHub HTTPS 地址<input autoFocus value={cloneUrl} onChange={(event) => setCloneUrl(event.target.value)} placeholder="https://github.com/owner/repository.git" maxLength={2048} /></label>
+            {cloneError ? <p className="dialog-error">{cloneError}</p> : null}
+            <div className="dialog-actions"><button type="button" disabled={busy === 'clone'} onClick={() => setShowCloneDialog(false)}>取消</button><button className="primary-action" type="submit" disabled={!cloneUrl.trim() || Boolean(busy)}>{busy === 'clone' ? '正在克隆…' : '开始克隆'}</button></div>
+          </form>
+        </div>
+      ) : null}
+
+      {pendingAction && confirmation ? (
+        <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setPendingAction(null) }}>
+          <section className="project-dialog confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="repository-confirmation-title">
+            <div className="dialog-icon"><Icon name={confirmation.icon} /></div>
+            <h2 id="repository-confirmation-title">{confirmation.title}</h2>
+            <p>{confirmation.detail}</p>
+            <div className="dialog-actions"><button type="button" disabled={Boolean(busy)} onClick={() => setPendingAction(null)}>取消</button><button className="primary-action" type="button" disabled={Boolean(busy)} onClick={() => void executePendingAction()}>{busy ? '正在执行…' : confirmation.action}</button></div>
+          </section>
+        </div>
+      ) : null}
+    </main>
+  )
+}
+
 function App() {
   const [view, setView] = useState<View>('chat')
   const [projects, setProjects] = useState<Project[]>([])
@@ -173,6 +622,8 @@ function App() {
   const [streamText, setStreamText] = useState('')
   const [steps, setSteps] = useState<AgentStep[]>([])
   const [prompt, setPrompt] = useState('')
+  const [taskKind, setTaskKind] = useState<TaskKind>('coding')
+  const [showTaskKindMenu, setShowTaskKindMenu] = useState(false)
   const [search, setSearch] = useState('')
   const [notice, setNotice] = useState('准备就绪')
   const [loadingProjects, setLoadingProjects] = useState(true)
@@ -195,9 +646,12 @@ function App() {
   const terminalRef = useRef(false)
   const messageEndRef = useRef<HTMLDivElement | null>(null)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
+  const taskKindMenuRef = useRef<HTMLDivElement | null>(null)
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null)
 
   const selectedProject = projects.find((item) => item.project_id === selectedProjectId) ?? null
   const selectedThread = threads.find((item) => item.thread_id === selectedThreadId) ?? null
+  const selectedTaskKind = taskKinds.find((item) => item.value === taskKind) ?? taskKinds[0]
   const filteredProjects = useMemo(() => {
     const query = search.trim().toLocaleLowerCase()
     if (!query) return projects
@@ -220,6 +674,31 @@ function App() {
     () => [...messages].sort((left, right) => left.sequence - right.sequence),
     [messages],
   )
+  const planningRunId = useMemo(
+    () => actionablePlanningRunId(runs),
+    [runs],
+  )
+
+  useEffect(() => {
+    if (!showTaskKindMenu) return
+
+    function closeTaskKindMenu(event: MouseEvent) {
+      if (!taskKindMenuRef.current?.contains(event.target as Node)) {
+        setShowTaskKindMenu(false)
+      }
+    }
+
+    function closeTaskKindMenuWithEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') setShowTaskKindMenu(false)
+    }
+
+    document.addEventListener('mousedown', closeTaskKindMenu)
+    document.addEventListener('keydown', closeTaskKindMenuWithEscape)
+    return () => {
+      document.removeEventListener('mousedown', closeTaskKindMenu)
+      document.removeEventListener('keydown', closeTaskKindMenuWithEscape)
+    }
+  }, [showTaskKindMenu])
 
   const refreshConversation = useCallback(async (threadId: string, runId?: string) => {
     const [latestThread, latestMessages, latestRuns, latestRun] = await Promise.all([
@@ -506,7 +985,7 @@ function App() {
     setSteps([])
     setStreamText('')
     try {
-      const created = await startRun(selectedThreadId, content)
+      const created = await startRun(selectedThreadId, content, taskKind)
       setMessages((current) => [...current, created.message])
       setActiveRun(created.run)
       setRuns((current) => [...current, created.run])
@@ -529,11 +1008,21 @@ function App() {
     setMobileSidebarOpen(false)
   }
 
+  function preparePlanImplementation() {
+    if (isRunning) return
+
+    setTaskKind('coding')
+    setShowTaskKindMenu(false)
+    setPrompt(implementPlanPrompt)
+    setNotice('已切换到 coding，请确认实施要求后发送')
+    requestAnimationFrame(() => composerInputRef.current?.focus())
+  }
+
   const isRunning = activeRun?.status === 'pending' || activeRun?.status === 'running'
   const lastRun = activeRun ?? runs.at(-1) ?? null
 
   return (
-    <div className={`workbench ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+    <div className={`workbench view-${view} ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       {mobileSidebarOpen ? <button className="sidebar-backdrop" type="button" aria-label="关闭导航" onClick={() => setMobileSidebarOpen(false)} /> : null}
       <aside className={`sidebar ${mobileSidebarOpen ? 'mobile-open' : ''}`}>
         <div className="brand-row">
@@ -568,6 +1057,7 @@ function App() {
         </div>
 
         <div className="sidebar-footer">
+          <button className={`skills-link ${view === 'repositories' ? 'active' : ''}`} type="button" onClick={() => { setView('repositories'); setMobileSidebarOpen(false) }}><span><Icon name="repository" />Repositories</span><Icon name="chevron-right" size={16} /></button>
           <button className={`skills-link ${view === 'skills' ? 'active' : ''}`} type="button" onClick={() => { setView('skills'); setMobileSidebarOpen(false) }}><span><Icon name="box" />Skills</span><Icon name="chevron-right" size={16} /></button>
           <div className="account-row"><span className="avatar">T</span><span><strong>tang</strong><small>本地工作区</small></span><Icon name="chevron-down" size={16} /></div>
         </div>
@@ -575,14 +1065,10 @@ function App() {
 
       <section className="content-shell">
         <header className="topbar">
-          <div className="topbar-leading"><button className="icon-button mobile-menu" type="button" aria-label="打开导航" onClick={() => setMobileSidebarOpen(true)}><Icon name="message" /></button><div className="breadcrumbs"><strong>{selectedProject?.name ?? 'Tang Agent'}</strong><span>/</span><span>{view === 'skills' ? 'Skills' : selectedThread?.title ?? '新对话'}</span></div></div>
+          <div className="topbar-leading"><button className="icon-button mobile-menu" type="button" aria-label="打开导航" onClick={() => setMobileSidebarOpen(true)}><Icon name="message" /></button><div className="breadcrumbs"><strong>{view === 'chat' ? selectedProject?.name ?? 'Tang Agent' : 'Tang Agent'}</strong><span>/</span><span>{view === 'skills' ? 'Skills' : view === 'repositories' ? 'Repositories' : selectedThread?.title ?? '新对话'}</span></div></div>
           <div className="topbar-actions">
-            <label className="search-box"><Icon name="search" size={17} /><input ref={searchInputRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索" /><kbd>⌘ K</kbd></label>
-            <span className="topbar-separator" />
-            <button className={`icon-button ${showRunPanel ? 'active' : ''}`} type="button" title="执行状态" onClick={() => setShowRunPanel((value) => !value)}><Icon name="terminal" /></button>
-            <button className="icon-button" type="button" title="历史记录"><Icon name="history" /></button>
-            <button className="icon-button" type="button" title="文档"><Icon name="book" /></button>
-            <button className="icon-button" type="button" title="设置"><Icon name="settings" /></button>
+            <label className="search-box"><Icon name="search" size={17} /><input ref={searchInputRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={view === 'repositories' ? '搜索仓库' : view === 'skills' ? '搜索 Skill' : '搜索'} /><kbd>⌘ K</kbd></label>
+            {view === 'chat' ? <><span className="topbar-separator" /><button className={`icon-button ${showRunPanel ? 'active' : ''}`} type="button" title="执行状态" onClick={() => setShowRunPanel((value) => !value)}><Icon name="terminal" /></button><button className="icon-button" type="button" title="历史记录"><Icon name="history" /></button><button className="icon-button" type="button" title="文档"><Icon name="book" /></button><button className="icon-button" type="button" title="设置"><Icon name="settings" /></button></> : null}
           </div>
         </header>
 
@@ -636,6 +1122,8 @@ function App() {
               </div>
             )}
           </main>
+        ) : view === 'repositories' ? (
+          <RepositoriesPage search={search} />
         ) : (
           <div className={`chat-layout ${showRunPanel ? '' : 'panel-hidden'}`}>
             <main className="conversation-column">
@@ -650,12 +1138,29 @@ function App() {
                   <div className="welcome-state"><Logo /><h1>开始一个新的 Agent 会话</h1><p>我可以帮你理解项目结构、生成代码、优化性能、解决问题等。</p><strong>你可以试试：</strong><div className="quick-grid">{quickPrompts.map((item) => <button type="button" key={item.label} onClick={() => setPrompt(item.prompt)}><span><Icon name={item.icon} /></span>{item.label}</button>)}</div></div>
                 ) : (
                   <div className="message-list">
-                    {orderedMessages.map((message) => (
-                      <article key={message.message_id} className={`message message-${message.role}`}>
-                        <div className="message-avatar">{message.role === 'user' ? <Icon name="user" size={16} /> : <Logo small />}</div>
-                        <div className="message-body"><div className="message-meta"><strong>{message.role === 'user' ? '你' : message.role === 'assistant' ? 'Tang Agent' : '系统'}</strong><time>{timeLabel(message.created_at)}</time></div><div className="message-content">{message.role === 'user' ? message.content : <MarkdownContent content={message.content} />}</div></div>
-                      </article>
-                    ))}
+                    {orderedMessages.map((message) => {
+                      const canImplementPlan = !isRunning
+                        && message.role === 'assistant'
+                        && message.run_id === planningRunId
+
+                      return (
+                        <article key={message.message_id} className={`message message-${message.role}`}>
+                          <div className="message-avatar">{message.role === 'user' ? <Icon name="user" size={16} /> : <Logo small />}</div>
+                          <div className="message-body">
+                            <div className="message-meta"><strong>{message.role === 'user' ? '你' : message.role === 'assistant' ? 'Tang Agent' : '系统'}</strong><time>{timeLabel(message.created_at)}</time></div>
+                            <div className="message-content">{message.role === 'user' ? message.content : <MarkdownContent content={message.content} />}</div>
+                            {canImplementPlan ? (
+                              <div className="plan-action">
+                                <button type="button" onClick={preparePlanImplementation}>
+                                  <Icon name="code" size={16} />
+                                  按此方案实施
+                                </button>
+                              </div>
+                            ) : null}
+                          </div>
+                        </article>
+                      )
+                    })}
                     {streamText ? <article className="message message-assistant streaming"><div className="message-avatar"><Logo small /></div><div className="message-body"><div className="message-meta"><strong>Tang Agent</strong><span className="typing-dot" /></div><div className="message-content"><MarkdownContent content={streamText} /></div></div></article> : null}
                     <div ref={messageEndRef} />
                   </div>
@@ -663,15 +1168,21 @@ function App() {
               </section>
 
               <form className="composer" onSubmit={(event) => void handleSubmit(event)}>
-                <div className="composer-main"><button className="attach-button" type="button" title="附件功能尚未接入">+</button><textarea value={prompt} onChange={(event) => { setPrompt(event.target.value); event.currentTarget.style.height = 'auto'; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 160)}px` }} placeholder={selectedThread ? '输入你的需求，按 Enter 发送' : '请先选择或创建会话'} rows={1} disabled={!selectedThread || isRunning} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} /><span className="model-label">DeepSeek V4<Icon name="chevron-down" size={14} /></span><button className="send-button" type="submit" disabled={!prompt.trim() || !selectedThread || submitting || isRunning}><Icon name="send" size={18} /></button></div>
-                <div className="composer-hint"><span>Enter 发送，Shift + Enter 换行</span><span>{notice}</span></div>
+                <div className="composer-main"><button className="attach-button" type="button" title="附件功能尚未接入">+</button><textarea ref={composerInputRef} value={prompt} onChange={(event) => { setPrompt(event.target.value); event.currentTarget.style.height = 'auto'; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 160)}px` }} placeholder={selectedThread ? '输入你的需求，按 Enter 发送' : '请先选择或创建会话'} rows={1} disabled={!selectedThread || isRunning} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} /><span className="model-label">DeepSeek V4<Icon name="chevron-down" size={14} /></span><button className="send-button" type="submit" disabled={!prompt.trim() || !selectedThread || submitting || isRunning}><Icon name="send" size={18} /></button></div>
+                <div className="composer-footer">
+                  <div className="task-kind-picker" ref={taskKindMenuRef}>
+                    {showTaskKindMenu ? <div className="task-kind-menu" role="listbox" aria-label="Agent 模式">{taskKinds.map((item) => <button className={item.value === taskKind ? 'selected' : ''} type="button" role="option" aria-selected={item.value === taskKind} key={item.value} onClick={() => { setTaskKind(item.value); setShowTaskKindMenu(false) }}><Icon name={item.icon} size={17} /><span>{item.value}</span>{item.value === taskKind ? <Icon name="check" size={16} /> : null}</button>)}</div> : null}
+                    <button className="task-kind-trigger" type="button" aria-haspopup="listbox" aria-expanded={showTaskKindMenu} onClick={() => setShowTaskKindMenu((value) => !value)}><Icon name={selectedTaskKind.icon} size={17} /><span>{taskKind}</span><Icon name="chevron-down" size={14} /></button>
+                  </div>
+                  <div className="composer-hint"><span>Enter 发送，Shift + Enter 换行</span><span>{notice}</span></div>
+                </div>
               </form>
             </main>
 
             <aside className={`run-panel ${showRunPanel ? 'open' : ''}`}>
               <div className="run-panel-header"><strong>Agent 执行状态</strong><span className={`run-state ${isRunning ? 'running' : lastRun?.status === 'failed' ? 'failed' : ''}`}><i />{isRunning ? '运行中' : lastRun?.status === 'failed' ? '失败' : lastRun?.status === 'completed' ? '已完成' : '空闲'}</span></div>
               <div className="run-panel-section"><h2>执行步骤</h2>{steps.length ? <ol className="step-list">{steps.map((step, index) => <li key={step.id} className={`step-${step.status} ${step.source.startsWith('subagent') ? 'step-subagent' : ''}`}><span className="step-number">{step.status === 'completed' ? <Icon name="check" size={14} /> : index + 1}</span><div><div className="step-title"><strong>{step.title}</strong><time>{timeLabel(step.createdAt)}</time></div><p>{step.detail}</p></div></li>)}</ol> : <div className="steps-empty"><Icon name="clock" /><p>发送任务后，这里会实时显示 Agent 的执行过程。</p></div>}</div>
-              <div className="run-details"><div className="details-heading"><strong>任务详情</strong><Icon name="chevron-down" size={16} /></div><dl><div><dt>任务 ID</dt><dd title={lastRun?.run_id}>{lastRun?.run_id.slice(0, 10) ?? '—'}</dd></div><div><dt>创建时间</dt><dd>{lastRun ? new Date(lastRun.created_at).toLocaleString('zh-CN') : '—'}</dd></div><div><dt>模型</dt><dd>DeepSeek V4</dd></div><div><dt>项目路径</dt><dd title={selectedProject?.virtual_path}>{selectedProject?.virtual_path ?? '—'}</dd></div></dl></div>
+              <div className="run-details"><div className="details-heading"><strong>任务详情</strong><Icon name="chevron-down" size={16} /></div><dl><div><dt>任务 ID</dt><dd title={lastRun?.run_id}>{lastRun?.run_id.slice(0, 10) ?? '—'}</dd></div><div><dt>创建时间</dt><dd>{lastRun ? new Date(lastRun.created_at).toLocaleString('zh-CN') : '—'}</dd></div><div><dt>执行模式</dt><dd>{lastRun?.task_kind ?? '—'}</dd></div><div><dt>模型</dt><dd>DeepSeek V4</dd></div><div><dt>项目路径</dt><dd title={selectedProject?.virtual_path}>{selectedProject?.virtual_path ?? '—'}</dd></div></dl></div>
             </aside>
           </div>
         )}

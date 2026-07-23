@@ -144,6 +144,7 @@ class RunResponse(BaseModel):
 
     run_id: str
     thread_id: str
+    task_kind: TaskKind
     status: RunStatus
     error: str | None
     created_at: datetime
@@ -151,6 +152,7 @@ class RunResponse(BaseModel):
 
 
 class RunCreateRequest(BaseModel):
+    task_kind: TaskKind | None = None
     content: str = Field(
         min_length=1,
         max_length=20_000,
@@ -182,3 +184,102 @@ class SkillSummaryResponse(BaseModel):
 
 class SkillDetailResponse(SkillSummaryResponse):
     content: str
+
+
+class RepositoryCloneRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2_048)
+
+    @field_validator("url")
+    @classmethod
+    def normalize_url(cls, value: str) -> str:
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("url 不能为空")
+
+        return normalized
+
+
+class RepositoryBranchRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("name 不能为空")
+
+        return normalized
+
+
+class RepositoryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    name: str
+    path: str
+    remote_url: str
+    current_branch: str
+    branches: list[str]
+    dirty: bool
+
+
+class RepositoryCommitRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=200)
+
+    @field_validator("message")
+    @classmethod
+    def normalize_message(cls, value: str) -> str:
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("message 不能为空")
+
+        return normalized
+
+
+class RepositoryCommitResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    repository: RepositoryResponse
+    sha: str
+    subject: str
+
+
+class RepositoryPushResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    repository: RepositoryResponse
+    branch: str
+
+
+class PullRequestCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=256)
+    body: str = Field(default="", max_length=10_000)
+    base: str = Field(default="main", min_length=1, max_length=255)
+
+    @field_validator("title", "base")
+    @classmethod
+    def normalize_required_text(cls, value: str) -> str:
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("字段不能为空")
+
+        return normalized
+
+    @field_validator("body")
+    @classmethod
+    def normalize_body(cls, value: str) -> str:
+        return value.strip()
+
+
+class PullRequestResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    number: int
+    url: str
+    title: str
+    base: str
+    head: str

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import PurePosixPath
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 from fastapi import (
     APIRouter,
@@ -31,6 +31,14 @@ from app.api.schemas import (
     RunCreateRequest,
     RunResponse,
     RunStartResponse,
+    RepositoryBranchRequest,
+    RepositoryCommitRequest,
+    RepositoryCommitResponse,
+    RepositoryCloneRequest,
+    RepositoryPushResponse,
+    RepositoryResponse,
+    PullRequestCreateRequest,
+    PullRequestResponse,
     TaskCreateRequest,
     TaskResponse,
     ThreadCreateRequest,
@@ -39,6 +47,18 @@ from app.api.schemas import (
     SkillSummaryResponse,
 )
 from app.skills import SkillCatalog
+from app.repositories import (
+    GitHubClient,
+    GitHubConfigurationError,
+    GitHubConflictError,
+    GitHubError,
+    GitHubValidationError,
+    RepositoryCatalog,
+    RepositoryConflictError,
+    RepositoryError,
+    RepositoryNotFoundError,
+    RepositoryValidationError,
+)
 from app.core.conversation_runtime import run_conversation_agent
 from app.core.conversation import (
     ConversationStore,
@@ -57,6 +77,215 @@ router = APIRouter()
 @router.get("/health")
 def health() -> dict[str, bool]:
     return {"ok": True}
+
+
+def _raise_repository_http_error(
+    error: RepositoryError,
+) -> NoReturn:
+    if isinstance(error, RepositoryValidationError):
+        status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    elif isinstance(error, RepositoryNotFoundError):
+        status_code = status.HTTP_404_NOT_FOUND
+    elif isinstance(error, RepositoryConflictError):
+        status_code = status.HTTP_409_CONFLICT
+    else:
+        status_code = status.HTTP_409_CONFLICT
+
+    raise HTTPException(
+        status_code=status_code,
+        detail=str(error),
+    ) from error
+
+
+def _raise_github_http_error(error: GitHubError) -> NoReturn:
+    if isinstance(error, GitHubValidationError):
+        status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    elif isinstance(error, GitHubConfigurationError):
+        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    elif isinstance(error, GitHubConflictError):
+        status_code = status.HTTP_409_CONFLICT
+    else:
+        status_code = status.HTTP_409_CONFLICT
+
+    raise HTTPException(
+        status_code=status_code,
+        detail=str(error),
+    ) from error
+
+
+@router.get(
+    "/api/repositories",
+    response_model=list[RepositoryResponse],
+)
+def list_repositories(
+    request: Request,
+) -> list[RepositoryResponse]:
+    workspace: Workspace = request.app.state.workspace
+
+    try:
+        snapshots = RepositoryCatalog(workspace).discover()
+    except RepositoryError as error:
+        _raise_repository_http_error(error)
+
+    return [
+        RepositoryResponse.model_validate(snapshot)
+        for snapshot in snapshots
+    ]
+
+
+@router.post(
+    "/api/repositories/clone",
+    response_model=RepositoryResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def clone_repository(
+    body: RepositoryCloneRequest,
+    request: Request,
+) -> RepositoryResponse:
+    workspace: Workspace = request.app.state.workspace
+
+    try:
+        snapshot = RepositoryCatalog(workspace).clone(body.url)
+    except RepositoryError as error:
+        _raise_repository_http_error(error)
+
+    return RepositoryResponse.model_validate(snapshot)
+
+
+@router.post(
+    "/api/repositories/{repository_name}/fetch",
+    response_model=RepositoryResponse,
+)
+def fetch_repository(
+    repository_name: str,
+    request: Request,
+) -> RepositoryResponse:
+    workspace: Workspace = request.app.state.workspace
+
+    try:
+        snapshot = RepositoryCatalog(workspace).fetch(repository_name)
+    except RepositoryError as error:
+        _raise_repository_http_error(error)
+
+    return RepositoryResponse.model_validate(snapshot)
+
+
+@router.post(
+    "/api/repositories/{repository_name}/commit",
+    response_model=RepositoryCommitResponse,
+)
+def commit_repository(
+    repository_name: str,
+    body: RepositoryCommitRequest,
+    request: Request,
+) -> RepositoryCommitResponse:
+    workspace: Workspace = request.app.state.workspace
+
+    try:
+        result = RepositoryCatalog(workspace).commit(
+            repository_name,
+            body.message,
+        )
+    except RepositoryError as error:
+        _raise_repository_http_error(error)
+
+    return RepositoryCommitResponse.model_validate(result)
+
+
+@router.post(
+    "/api/repositories/{repository_name}/push",
+    response_model=RepositoryPushResponse,
+)
+def push_repository(
+    repository_name: str,
+    request: Request,
+) -> RepositoryPushResponse:
+    workspace: Workspace = request.app.state.workspace
+
+    try:
+        result = RepositoryCatalog(workspace).push(repository_name)
+    except RepositoryError as error:
+        _raise_repository_http_error(error)
+
+    return RepositoryPushResponse.model_validate(result)
+
+
+@router.post(
+    "/api/repositories/{repository_name}/pull-requests",
+    response_model=PullRequestResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_repository_pull_request(
+    repository_name: str,
+    body: PullRequestCreateRequest,
+    request: Request,
+) -> PullRequestResponse:
+    workspace: Workspace = request.app.state.workspace
+    catalog = RepositoryCatalog(workspace)
+
+    try:
+        repository = catalog.prepare_pull_request(
+            repository_name,
+            body.base,
+        )
+        result = GitHubClient(workspace).create_pull_request(
+            repository_name=repository.name,
+            remote_url=repository.remote_url,
+            head=repository.current_branch,
+            base=body.base,
+            title=body.title,
+            body=body.body,
+        )
+    except RepositoryError as error:
+        _raise_repository_http_error(error)
+    except GitHubError as error:
+        _raise_github_http_error(error)
+
+    return PullRequestResponse.model_validate(result)
+
+
+@router.post(
+    "/api/repositories/{repository_name}/branches",
+    response_model=RepositoryResponse,
+)
+def create_repository_branch(
+    repository_name: str,
+    body: RepositoryBranchRequest,
+    request: Request,
+) -> RepositoryResponse:
+    workspace: Workspace = request.app.state.workspace
+
+    try:
+        snapshot = RepositoryCatalog(workspace).create_branch(
+            repository_name,
+            body.name,
+        )
+    except RepositoryError as error:
+        _raise_repository_http_error(error)
+
+    return RepositoryResponse.model_validate(snapshot)
+
+
+@router.post(
+    "/api/repositories/{repository_name}/checkout",
+    response_model=RepositoryResponse,
+)
+def checkout_repository_branch(
+    repository_name: str,
+    body: RepositoryBranchRequest,
+    request: Request,
+) -> RepositoryResponse:
+    workspace: Workspace = request.app.state.workspace
+
+    try:
+        snapshot = RepositoryCatalog(workspace).checkout(
+            repository_name,
+            body.name,
+        )
+    except RepositoryError as error:
+        _raise_repository_http_error(error)
+
+    return RepositoryResponse.model_validate(snapshot)
 
 @router.get(
     "/api/skills",
@@ -548,10 +777,14 @@ def start_thread_run(
     )
 
     try:
+        task_kind = body.task_kind or classify_task_kind(
+            body.content
+        )
         run, message = (
             navigation_store.start_run_with_message(
                 thread_id=thread_id,
                 content=body.content,
+                task_kind=task_kind,
             )
         )
     except KeyError as exc:

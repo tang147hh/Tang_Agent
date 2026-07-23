@@ -12,8 +12,7 @@ from langchain_core.messages import (
     ToolMessageChunk,
 )
 
-from app.core.conversation import ConversationStore
-from app.core.task_intent import classify_task_kind
+from app.core.conversation import ConversationStore, MessageSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +25,36 @@ class _ToolCall:
     name: str
     call_id: str | None
     subagent: str | None
+
+
+def _model_messages(
+    messages: list[MessageSnapshot],
+    *,
+    current_message_id: str,
+    project_virtual_path: str,
+) -> list[dict[str, str]]:
+    """从 SQLite 消息快照重建本次 Run 的完整模型上下文。"""
+
+    model_messages: list[dict[str, str]] = []
+
+    for message in sorted(messages, key=lambda item: item.sequence):
+        content = message.content
+
+        if message.message_id == current_message_id:
+            content = (
+                f"当前项目虚拟路径：{project_virtual_path}\n"
+                "请只处理该项目范围内的任务。\n\n"
+                f"用户请求：{message.content}"
+            )
+
+        model_messages.append(
+            {
+                "role": message.role.value,
+                "content": content,
+            }
+        )
+
+    return model_messages
 
 
 def _stream_source(namespace: Any) -> str:
@@ -173,13 +202,12 @@ def run_conversation_agent(
         if user_message is None:
             raise RuntimeError(f"Run 没有关联的用户消息：{run_id}")
 
-        task_kind = classify_task_kind(user_message.content)
-        agent = agent_factory(task_kind)
+        agent = agent_factory(run.task_kind)
 
-        prompt = (
-            f"当前项目虚拟路径：{project.virtual_path}\n"
-            f"请只处理该项目范围内的任务。\n\n"
-            f"用户请求：{user_message.content}"
+        model_messages = _model_messages(
+            messages,
+            current_message_id=user_message.message_id,
+            project_virtual_path=project.virtual_path,
         )
 
         answer_parts: list[str] = []
@@ -195,6 +223,7 @@ def run_conversation_agent(
             source="system",
             payload={
                 "status": "pending",
+                "task_kind": run.task_kind.value,
             },
         )
 
@@ -206,6 +235,7 @@ def run_conversation_agent(
             source="system",
             payload={
                 "status": "running",
+                "task_kind": run.task_kind.value,
             },
         )
 
@@ -242,16 +272,11 @@ def run_conversation_agent(
 
         stream = agent.stream(
             {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
-                ]
+                "messages": model_messages,
             },
             config={
                 "configurable": {
-                    "thread_id": thread.thread_id,
+                    "thread_id": run_id,
                 }
             },
             stream_mode="messages",

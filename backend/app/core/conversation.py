@@ -5,6 +5,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol
 
+from app.core.task_intent import TaskKind
+
 
 class ThreadStatus(StrEnum):
     """会话当前是否正在执行 Agent。"""
@@ -66,6 +68,7 @@ class MessageSnapshot:
 class RunSnapshot:
     run_id: str
     thread_id: str
+    task_kind: TaskKind
     status: RunStatus
     error: str | None
     created_at: datetime
@@ -129,6 +132,7 @@ class ConversationStore(
         self,
         *,
         thread_id: str,
+        task_kind: TaskKind = TaskKind.QA,
     ) -> RunSnapshot: ...
 
     def start_run_with_message(
@@ -136,6 +140,7 @@ class ConversationStore(
         *,
         thread_id: str,
         content: str,
+        task_kind: TaskKind = TaskKind.QA,
     ) -> tuple[RunSnapshot, MessageSnapshot]:
         """原子创建 Run 和对应的用户消息。"""
         ...

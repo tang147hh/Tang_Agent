@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,9 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
 def backend(tmp_path: Path) -> LocalShellBackend:
     workspace = Workspace(tmp_path / "workspace")
     workspace.ensure_layout()
+    runtime_bin = workspace.root / "runtimes" / "python" / "bin"
+    runtime_bin.mkdir(parents=True)
+    (runtime_bin / "python").symlink_to(sys.executable)
     return LocalShellBackend(workspace)
 
 
@@ -130,6 +134,118 @@ def test_coding_tools_write_and_execute(
     assert write_result["status"] == "created"
     assert command_result["exit_code"] == 0
     assert command_result["stdout"].strip() == "tool loop"
+
+
+def test_rejected_command_returns_recoverable_tool_result(
+    backend: LocalShellBackend,
+) -> None:
+    scoped = TaskScopedBackend.for_task(
+        TaskKind.CODING,
+        backend,
+    )
+    tools = {
+        tool.name: tool
+        for tool in build_workspace_tools(scoped)
+    }
+
+    result = tools["workspace_execute"].invoke(
+        {
+            "argv": ["python", "-c", "print('unsafe')"],
+            "cwd": "/projects",
+            "timeout": 10,
+        }
+    )
+
+    assert result == {
+        "status": "rejected",
+        "error": "禁止使用 python -c 执行任意内联代码",
+        "recoverable": True,
+        "hint": (
+            "命令未执行。请改用符合策略的命令；"
+            "验证文件内容时优先使用 workspace_read。"
+        ),
+    }
+
+
+def test_deep_agent_recovers_from_rejected_command(
+    backend: LocalShellBackend,
+) -> None:
+    backend.write_text(
+        "/projects/demo/docs/course-test.md",
+        "# Course test\n",
+    )
+
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_execute",
+                        "args": {
+                            "argv": [
+                                "python",
+                                "-c",
+                                "print('verify')",
+                            ],
+                            "cwd": "/projects/demo",
+                            "timeout": 10,
+                        },
+                        "id": "call_rejected",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_read",
+                        "args": {
+                            "path": (
+                                "/projects/demo/docs/"
+                                "course-test.md"
+                            ),
+                            "offset": 0,
+                            "limit": 100,
+                        },
+                        "id": "call_read",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="文件内容验证完成"),
+        ]
+    )
+
+    agent = build_agent(
+        TaskKind.CODING,
+        backend=backend,
+        model=model,
+    )
+
+    result = agent.invoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "验证课程测试文档",
+                }
+            ]
+        }
+    )
+
+    tool_messages = [
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage)
+    ]
+
+    assert len(tool_messages) == 2
+    assert "rejected" in str(tool_messages[0].content)
+    assert "workspace_read" in str(tool_messages[0].content)
+    assert "# Course test" in str(tool_messages[1].content)
+    assert result["messages"][-1].content == "文件内容验证完成"
 
 
 def test_deep_agent_completes_tool_loop(

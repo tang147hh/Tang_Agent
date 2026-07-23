@@ -21,6 +21,7 @@ export type ThreadStatus = (typeof threadStatuses)[number]
 export type RunStatus = (typeof runStatuses)[number]
 export type MessageRole = (typeof messageRoles)[number]
 export type RunEventKind = (typeof runEventKinds)[number]
+export type TaskKind = 'coding' | 'analysis' | 'planning' | 'qa'
 
 export interface Project {
   project_id: string
@@ -52,6 +53,7 @@ export interface Message {
 export interface Run {
   run_id: string
   thread_id: string
+  task_kind: TaskKind
   status: RunStatus
   error: string | null
   created_at: string
@@ -73,11 +75,40 @@ export interface SkillDetail extends SkillSummary {
   content: string
 }
 
+export interface Repository {
+  name: string
+  path: string
+  remote_url: string
+  current_branch: string
+  branches: string[]
+  dirty: boolean
+}
+
+export interface RepositoryCommitResult {
+  repository: Repository
+  sha: string
+  subject: string
+}
+
+export interface RepositoryPushResult {
+  repository: Repository
+  branch: string
+}
+
+export interface PullRequest {
+  number: number
+  url: string
+  title: string
+  base: string
+  head: string
+}
+
 export interface RunEventPayload {
   run_id: string
   source: string
   created_at: string
   status?: RunStatus
+  task_kind?: TaskKind
   text?: string
   name?: string
   tool_call_id?: string
@@ -166,10 +197,14 @@ export function getRun(runId: string): Promise<Run> {
   return requestJson<Run>(`/api/runs/${encodeURIComponent(runId)}`)
 }
 
-export function startRun(threadId: string, content: string): Promise<RunStartResponse> {
+export function startRun(
+  threadId: string,
+  content: string,
+  taskKind: TaskKind,
+): Promise<RunStartResponse> {
   return requestJson<RunStartResponse>(
     `/api/threads/${encodeURIComponent(threadId)}/runs`,
-    jsonRequest('POST', { content }),
+    jsonRequest('POST', { content, task_kind: taskKind }),
   )
 }
 
@@ -184,5 +219,76 @@ export function listSkills(): Promise<SkillSummary[]> {
 export function getSkill(skillName: string): Promise<SkillDetail> {
   return requestJson<SkillDetail>(
     `/api/skills/${encodeURIComponent(skillName)}`,
+  )
+}
+
+export function listRepositories(): Promise<Repository[]> {
+  return requestJson<Repository[]>('/api/repositories')
+}
+
+export function cloneRepository(url: string): Promise<Repository> {
+  return requestJson<Repository>(
+    '/api/repositories/clone',
+    jsonRequest('POST', { url }),
+  )
+}
+
+export function fetchRepository(name: string): Promise<Repository> {
+  return requestJson<Repository>(
+    `/api/repositories/${encodeURIComponent(name)}/fetch`,
+    jsonRequest('POST', {}),
+  )
+}
+
+export function createRepositoryBranch(
+  repositoryName: string,
+  branchName: string,
+): Promise<Repository> {
+  return requestJson<Repository>(
+    `/api/repositories/${encodeURIComponent(repositoryName)}/branches`,
+    jsonRequest('POST', { name: branchName }),
+  )
+}
+
+export function checkoutRepositoryBranch(
+  repositoryName: string,
+  branchName: string,
+): Promise<Repository> {
+  return requestJson<Repository>(
+    `/api/repositories/${encodeURIComponent(repositoryName)}/checkout`,
+    jsonRequest('POST', { name: branchName }),
+  )
+}
+
+export function commitRepository(
+  repositoryName: string,
+  message: string,
+): Promise<RepositoryCommitResult> {
+  return requestJson<RepositoryCommitResult>(
+    `/api/repositories/${encodeURIComponent(repositoryName)}/commit`,
+    jsonRequest('POST', { message }),
+  )
+}
+
+export function pushRepository(
+  repositoryName: string,
+): Promise<RepositoryPushResult> {
+  return requestJson<RepositoryPushResult>(
+    `/api/repositories/${encodeURIComponent(repositoryName)}/push`,
+    jsonRequest('POST', {}),
+  )
+}
+
+export function createRepositoryPullRequest(
+  repositoryName: string,
+  input: {
+    title: string
+    body: string
+    base: string
+  },
+): Promise<PullRequest> {
+  return requestJson<PullRequest>(
+    `/api/repositories/${encodeURIComponent(repositoryName)}/pull-requests`,
+    jsonRequest('POST', input),
   )
 }
