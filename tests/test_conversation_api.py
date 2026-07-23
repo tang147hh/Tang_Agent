@@ -144,6 +144,82 @@ class ObservableConversationAgent:
         }
 
 
+class RepeatedToolConversationAgent:
+    def stream(self, *args, **kwargs):
+        del args, kwargs
+        for index in range(3):
+            yield {
+                "type": "messages",
+                "ns": (),
+                "data": (
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "workspace_read",
+                                "args": {
+                                    "path": "/projects/demo/README.md",
+                                },
+                                "id": f"repeat-{index}",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    {},
+                ),
+            }
+
+
+class RecoverableRejectionConversationAgent:
+    def stream(self, *args, **kwargs):
+        del args, kwargs
+        yield {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "workspace_execute",
+                            "args": {"argv": ["python", "-c", "bad"]},
+                            "id": "rejected-command",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                {},
+            ),
+        }
+        yield {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "rejected",
+                            "recoverable": True,
+                            "error_type": "CommandPolicyError",
+                        }
+                    ),
+                    tool_call_id="rejected-command",
+                    name="workspace_execute",
+                    status="error",
+                ),
+                {},
+            ),
+        }
+        yield {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                AIMessageChunk(content="已改用安全方式完成任务"),
+                {},
+            ),
+        }
+
+
 def _conversation_app(
     tmp_path: Path,
     *,
@@ -692,3 +768,84 @@ def test_background_agent_failure_updates_state(
 
     assert len(run_messages) == 1
     assert run_messages[0]["role"] == "user"
+
+
+def test_run_performance_is_available_by_run_id(
+    tmp_path: Path,
+) -> None:
+    app, thread, _ = _conversation_app(tmp_path)
+    with TestClient(app) as client:
+        created = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={"content": "分析项目", "task_kind": "analysis"},
+        )
+        run_id = created.json()["run"]["run_id"]
+        response = client.get(f"/api/runs/{run_id}/performance")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_id"] == run_id
+    assert payload["task_kind"] == "analysis"
+    assert payload["max_model_calls"] == 8
+    assert payload["max_tool_calls"] == 20
+    assert payload["model_calls"] == 1
+    assert payload["first_output_ms"] is not None
+    assert payload["duration_ms"] is not None
+    assert payload["termination_reason"] is None
+
+
+def test_repeated_tool_loop_terminates_run_and_thread(
+    tmp_path: Path,
+) -> None:
+    app, thread, _ = _conversation_app(
+        tmp_path,
+        agent_factory=lambda task_kind: RepeatedToolConversationAgent(),
+    )
+    with TestClient(app) as client:
+        created = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={"content": "分析项目", "task_kind": "analysis"},
+        )
+        run_id = created.json()["run"]["run_id"]
+        run = client.get(f"/api/runs/{run_id}").json()
+        current_thread = client.get(
+            f"/api/threads/{thread.thread_id}"
+        ).json()
+        performance = client.get(
+            f"/api/runs/{run_id}/performance"
+        ).json()
+        stream = client.get(f"/api/runs/{run_id}/events").text
+
+    assert run["status"] == "failed"
+    assert "重复调用" in run["error"]
+    assert current_thread["status"] == "error"
+    assert performance["termination_reason"] == "repeated_tool_call"
+    assert performance["tool_calls"] == 3
+    assert performance["repeated_tool_calls"] == 2
+    assert "event: terminated" in stream
+
+
+def test_recoverable_safety_rejection_does_not_fail_run(
+    tmp_path: Path,
+) -> None:
+    app, thread, _ = _conversation_app(
+        tmp_path,
+        agent_factory=lambda task_kind: (
+            RecoverableRejectionConversationAgent()
+        ),
+    )
+    with TestClient(app) as client:
+        created = client.post(
+            f"/api/threads/{thread.thread_id}/runs",
+            json={"content": "安全执行", "task_kind": "coding"},
+        )
+        run_id = created.json()["run"]["run_id"]
+        run = client.get(f"/api/runs/{run_id}").json()
+        performance = client.get(
+            f"/api/runs/{run_id}/performance"
+        ).json()
+
+    assert run["status"] == "completed"
+    assert performance["tool_errors"] == 1
+    assert performance["safety_rejections"] == 1
+    assert performance["termination_reason"] is None

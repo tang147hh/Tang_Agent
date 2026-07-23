@@ -293,3 +293,50 @@ def test_run_events_survive_reopen_and_resume(
     assert remaining[-1].payload == {
         "text": "正在分析项目",
     }
+
+
+def test_run_performance_survives_store_reopen(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "tasks.sqlite"
+    store = SQLiteProjectThreadStore(database)
+    thread = _create_thread(store)
+    run = store.create_run(
+        thread_id=thread.thread_id,
+        task_kind=TaskKind.CODING,
+    )
+    store.initialize_run_performance(
+        run_id=run.run_id,
+        task_kind=TaskKind.CODING,
+        max_model_calls=16,
+        max_tool_calls=40,
+        max_first_output_seconds=30.0,
+        max_seconds=480.0,
+        max_identical_tool_calls=2,
+    )
+    store.update_run_performance(
+        run_id=run.run_id,
+        model_calls=3,
+        tool_calls=5,
+        repeated_tool_calls=1,
+        tool_errors=2,
+        safety_rejections=1,
+        first_output_ms=125.0,
+        duration_ms=750.0,
+        termination_reason="tool_call_limit",
+    )
+
+    reopened = SQLiteProjectThreadStore(database)
+    performance = reopened.get_run_performance(run.run_id)
+
+    assert performance is not None
+    assert performance.run_id == run.run_id
+    assert performance.task_kind is TaskKind.CODING
+    assert performance.model_calls == 3
+    assert performance.tool_calls == 5
+    assert performance.repeated_tool_calls == 1
+    assert performance.tool_errors == 2
+    assert performance.safety_rejections == 1
+    assert performance.first_output_ms == 125.0
+    assert performance.duration_ms == 750.0
+    assert performance.termination_reason == "tool_call_limit"

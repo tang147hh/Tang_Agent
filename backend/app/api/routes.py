@@ -13,6 +13,7 @@ from fastapi import (
     Request,
     status,
     Path as ApiPath,
+    Query,
 )
 from fastapi.sse import (
     EventSourceResponse,
@@ -30,7 +31,10 @@ from app.api.schemas import (
     ProjectResponse,
     RunCreateRequest,
     RunResponse,
+    RunPerformanceResponse,
     RunStartResponse,
+    ReviewFindingResponse,
+    ReviewFindingStatusUpdateRequest,
     RepositoryBranchRequest,
     RepositoryCommitRequest,
     RepositoryCommitResponse,
@@ -65,6 +69,8 @@ from app.core.conversation import (
     RunStatus,
 )
 from app.core.task_intent import classify_task_kind
+from app.core.run_limits import budget_for
+from app.core.review import ReviewFindingStatus, ReviewSeverity
 from app.core.task_runtime import (
     AgentFactory,
     TaskStore,
@@ -443,6 +449,7 @@ async def stream_task_events(
             if event.kind in {
                 "completed",
                 "failed",
+                "terminated",
             }:
                 terminal_seen = True
 
@@ -675,6 +682,91 @@ def get_run(
     return RunResponse.model_validate(run)
 
 
+@router.get(
+    "/api/runs/{run_id}/performance",
+    response_model=RunPerformanceResponse | None,
+)
+def get_run_performance(
+    run_id: str,
+    request: Request,
+) -> RunPerformanceResponse | None:
+    conversation_store: ConversationStore = (
+        request.app.state.navigation_store
+    )
+    if conversation_store.get_run(run_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="run not found",
+        )
+    performance = conversation_store.get_run_performance(run_id)
+    if performance is None:
+        return None
+    return RunPerformanceResponse.model_validate(performance)
+
+
+@router.get(
+    "/api/runs/{run_id}/review-findings",
+    response_model=list[ReviewFindingResponse],
+)
+def list_run_review_findings(
+    run_id: str,
+    request: Request,
+    severity: ReviewSeverity | None = None,
+    finding_status: Annotated[
+        ReviewFindingStatus | None,
+        Query(alias="status"),
+    ] = None,
+) -> list[ReviewFindingResponse]:
+    conversation_store: ConversationStore = (
+        request.app.state.navigation_store
+    )
+    if conversation_store.get_run(run_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="run not found",
+        )
+    return [
+        ReviewFindingResponse.model_validate(finding)
+        for finding in conversation_store.list_review_findings(
+            run_id,
+            severity=severity,
+            status=finding_status,
+        )
+    ]
+
+
+@router.patch(
+    "/api/runs/{run_id}/review-findings/{finding_id}",
+    response_model=ReviewFindingResponse,
+)
+def update_run_review_finding(
+    run_id: str,
+    finding_id: str,
+    body: ReviewFindingStatusUpdateRequest,
+    request: Request,
+) -> ReviewFindingResponse:
+    conversation_store: ConversationStore = (
+        request.app.state.navigation_store
+    )
+    if conversation_store.get_run(run_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="run not found",
+        )
+    try:
+        finding = conversation_store.update_review_finding_status(
+            run_id=run_id,
+            finding_id=finding_id,
+            status=body.status,
+        )
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="review finding not found",
+        ) from exc
+    return ReviewFindingResponse.model_validate(finding)
+
+
 def require_existing_run_store(
     run_id: str,
     request: Request,
@@ -724,6 +816,7 @@ async def stream_run_events(
             if event.kind in {
                 "completed",
                 "failed",
+                "terminated",
             }:
                 terminal_seen = True
 
@@ -780,6 +873,7 @@ def start_thread_run(
         task_kind = body.task_kind or classify_task_kind(
             body.content
         )
+        budget = budget_for(task_kind)
         run, message = (
             navigation_store.start_run_with_message(
                 thread_id=thread_id,
@@ -787,6 +881,28 @@ def start_thread_run(
                 task_kind=task_kind,
             )
         )
+        try:
+            navigation_store.initialize_run_performance(
+                run_id=run.run_id,
+                task_kind=task_kind,
+                max_model_calls=budget.max_model_calls,
+                max_tool_calls=budget.max_tool_calls,
+                max_first_output_seconds=(
+                    budget.max_first_output_seconds
+                ),
+                max_seconds=budget.max_seconds,
+                max_identical_tool_calls=(
+                    budget.max_identical_tool_calls
+                ),
+            )
+        except Exception as exc:
+            navigation_store.fail_run(
+                run.run_id,
+                "Run 性能指标初始化失败",
+            )
+            raise RuntimeError(
+                "failed to initialize run performance"
+            ) from exc
     except KeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -803,6 +919,7 @@ def start_thread_run(
         run_id=run.run_id,
         conversation_store=navigation_store,
         agent_factory=request.app.state.agent_factory,
+        workspace=request.app.state.workspace,
     )
 
     return RunStartResponse(

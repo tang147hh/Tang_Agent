@@ -10,6 +10,7 @@ import {
   createThread,
   fetchRepository,
   getRun,
+  getRunPerformance,
   getSkill,
   getThread,
   listMessages,
@@ -29,6 +30,7 @@ import type {
   PullRequest,
   Repository,
   Run,
+  RunPerformance,
   RunEventKind,
   RunEventPayload,
   SkillDetail,
@@ -104,6 +106,7 @@ const stepCopy: Record<RunEventKind, { title: string; detail: string }> = {
   tool_finished: { title: '工具执行完成', detail: '工具结果已返回 Agent' },
   completed: { title: '完成', detail: '任务执行完成，等待下一条指令' },
   failed: { title: '执行失败', detail: '任务未能完成，请查看错误信息' },
+  terminated: { title: '预算已终止', detail: 'Run 已达到执行预算并安全结束' },
 }
 
 const implementPlanPrompt = '请按照上面的方案开始实施，并在完成后运行相关测试。'
@@ -165,6 +168,21 @@ function timeLabel(value: string): string {
   return new Date(value).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
+function durationLabel(value: number | null | undefined): string {
+  if (value === null || value === undefined) return '—'
+  if (value < 1000) return `${Math.round(value)} ms`
+  return `${(value / 1000).toFixed(1)} s`
+}
+
+const terminationLabels: Record<string, string> = {
+  model_call_limit: '模型调用预算',
+  tool_call_limit: '工具调用预算',
+  first_output_timeout: '首输出超时',
+  total_time_limit: '总运行超时',
+  repeated_tool_call: '重复工具循环',
+  agent_error: 'Agent 执行错误',
+}
+
 function stepIdentity(kind: RunEventKind, payload: RunEventPayload, eventId: string): string {
   if ((kind === 'tool_started' || kind === 'tool_finished') && payload.tool_call_id) {
     return `tool:${payload.tool_call_id}`
@@ -207,7 +225,9 @@ function stepPresentation(kind: RunEventKind, payload: RunEventPayload) {
 
   return {
     title: copy.title,
-    detail: kind === 'failed' ? payload.error ?? copy.detail : copy.detail,
+    detail: kind === 'failed' || kind === 'terminated'
+      ? payload.error ?? copy.detail
+      : copy.detail,
   }
 }
 
@@ -619,6 +639,7 @@ function App() {
   const [selectedSkillName, setSelectedSkillName] = useState<string | null>(null)
   const [skillDetail, setSkillDetail] = useState<SkillDetail | null>(null)
   const [activeRun, setActiveRun] = useState<Run | null>(null)
+  const [runPerformance, setRunPerformance] = useState<RunPerformance | null>(null)
   const [streamText, setStreamText] = useState('')
   const [steps, setSteps] = useState<AgentStep[]>([])
   const [prompt, setPrompt] = useState('')
@@ -712,9 +733,14 @@ function App() {
         ? latestRuns.map((run) => run.run_id === latestRun.run_id ? latestRun : run)
         : [...latestRuns, latestRun]
       : latestRuns
+    const performanceRunId = runId ?? authoritativeRuns.at(-1)?.run_id
+    const latestPerformance = performanceRunId
+      ? await getRunPerformance(performanceRunId)
+      : null
     setThreads((current) => current.map((item) => item.thread_id === latestThread.thread_id ? latestThread : item))
     setMessages(latestMessages)
     setRuns(authoritativeRuns)
+    setRunPerformance(latestPerformance)
     const running = [...authoritativeRuns].reverse().find((run) => run.status === 'pending' || run.status === 'running') ?? null
     setActiveRun(running)
   }, [])
@@ -728,12 +754,12 @@ function App() {
     setSteps((current) => {
       const id = stepIdentity(kind, payload, eventId)
       const presentation = stepPresentation(kind, payload)
-      const status = kind === 'failed'
+      const status = kind === 'failed' || kind === 'terminated' || payload.status === 'failed' || payload.status === 'error'
         ? 'failed' as const
         : kind === 'created' || kind === 'completed' || kind === 'tool_finished'
           ? 'completed' as const
           : 'running' as const
-      const previousStatus = kind === 'failed' ? 'failed' as const : 'completed' as const
+      const previousStatus = kind === 'failed' || kind === 'terminated' ? 'failed' as const : 'completed' as const
       const completedPrevious = current.map((step) => {
         if (step.status !== 'running' || step.id === id) return step
         if (step.toolCallId && payload.source === `subagent:${step.toolCallId}`) return step
@@ -786,13 +812,18 @@ function App() {
             setStreamText((current) => current + payload.text)
           }
 
-          if (payload.status) {
-            setActiveRun((current) => current ? { ...current, status: payload.status! } : current)
+          if (
+            payload.status
+            && payload.status !== 'error'
+            && ['created', 'running', 'completed', 'failed', 'terminated'].includes(kind)
+          ) {
+            const runStatus: Run['status'] = payload.status
+            setActiveRun((current) => current ? { ...current, status: runStatus } : current)
           }
 
           if (kind === 'running') setNotice('Agent 正在执行')
 
-          if (kind === 'completed' || kind === 'failed') {
+          if (kind === 'completed' || kind === 'failed' || kind === 'terminated') {
             terminalRef.current = true
             source.close()
             setNotice(kind === 'completed' ? '任务执行完成' : payload.error ?? '任务执行失败')
@@ -908,6 +939,7 @@ function App() {
     setSteps([])
     setStreamText('')
     setActiveRun(null)
+    setRunPerformance(null)
     if (!selectedThreadId) return
 
     let cancelled = false
@@ -920,6 +952,14 @@ function App() {
         setRuns(latestRuns)
         const running = [...latestRuns].reverse().find((run) => run.status === 'pending' || run.status === 'running') ?? null
         setActiveRun(running)
+        const latestRun = running ?? latestRuns.at(-1) ?? null
+        if (latestRun) {
+          void getRunPerformance(latestRun.run_id)
+            .then((performance) => {
+              if (!cancelled) setRunPerformance(performance)
+            })
+            .catch(() => undefined)
+        }
         if (running) connectToRun(running.run_id, selectedThreadId)
       })
       .catch((error: unknown) => setNotice(error instanceof Error ? error.message : '会话加载失败'))
@@ -984,6 +1024,7 @@ function App() {
     setSubmitting(true)
     setSteps([])
     setStreamText('')
+    setRunPerformance(null)
     try {
       const created = await startRun(selectedThreadId, content, taskKind)
       setMessages((current) => [...current, created.message])
@@ -992,6 +1033,9 @@ function App() {
       setPrompt('')
       setNotice('任务已创建，正在连接 Agent')
       connectToRun(created.run.run_id, selectedThreadId)
+      void getRunPerformance(created.run.run_id)
+        .then(setRunPerformance)
+        .catch(() => undefined)
       void getThread(selectedThreadId).then((thread) => {
         setThreads((current) => [thread, ...current.filter((item) => item.thread_id !== thread.thread_id)])
       }).catch(() => undefined)
@@ -1182,7 +1226,7 @@ function App() {
             <aside className={`run-panel ${showRunPanel ? 'open' : ''}`}>
               <div className="run-panel-header"><strong>Agent 执行状态</strong><span className={`run-state ${isRunning ? 'running' : lastRun?.status === 'failed' ? 'failed' : ''}`}><i />{isRunning ? '运行中' : lastRun?.status === 'failed' ? '失败' : lastRun?.status === 'completed' ? '已完成' : '空闲'}</span></div>
               <div className="run-panel-section"><h2>执行步骤</h2>{steps.length ? <ol className="step-list">{steps.map((step, index) => <li key={step.id} className={`step-${step.status} ${step.source.startsWith('subagent') ? 'step-subagent' : ''}`}><span className="step-number">{step.status === 'completed' ? <Icon name="check" size={14} /> : index + 1}</span><div><div className="step-title"><strong>{step.title}</strong><time>{timeLabel(step.createdAt)}</time></div><p>{step.detail}</p></div></li>)}</ol> : <div className="steps-empty"><Icon name="clock" /><p>发送任务后，这里会实时显示 Agent 的执行过程。</p></div>}</div>
-              <div className="run-details"><div className="details-heading"><strong>任务详情</strong><Icon name="chevron-down" size={16} /></div><dl><div><dt>任务 ID</dt><dd title={lastRun?.run_id}>{lastRun?.run_id.slice(0, 10) ?? '—'}</dd></div><div><dt>创建时间</dt><dd>{lastRun ? new Date(lastRun.created_at).toLocaleString('zh-CN') : '—'}</dd></div><div><dt>执行模式</dt><dd>{lastRun?.task_kind ?? '—'}</dd></div><div><dt>模型</dt><dd>DeepSeek V4</dd></div><div><dt>项目路径</dt><dd title={selectedProject?.virtual_path}>{selectedProject?.virtual_path ?? '—'}</dd></div></dl></div>
+              <div className="run-details"><div className="details-heading"><strong>任务详情</strong><Icon name="chevron-down" size={16} /></div><dl><div><dt>任务 ID</dt><dd title={lastRun?.run_id}>{lastRun?.run_id.slice(0, 10) ?? '—'}</dd></div><div><dt>创建时间</dt><dd>{lastRun ? new Date(lastRun.created_at).toLocaleString('zh-CN') : '—'}</dd></div><div><dt>执行模式</dt><dd>{lastRun?.task_kind ?? '—'}</dd></div><div><dt>首个输出</dt><dd>{durationLabel(runPerformance?.first_output_ms)}</dd></div><div><dt>运行耗时</dt><dd>{durationLabel(runPerformance?.duration_ms)}</dd></div><div><dt>模型调用</dt><dd>{runPerformance ? `${runPerformance.model_calls} / ${runPerformance.max_model_calls}` : '—'}</dd></div><div><dt>工具调用</dt><dd>{runPerformance ? `${runPerformance.tool_calls} / ${runPerformance.max_tool_calls}` : '—'}</dd></div><div><dt>重复调用</dt><dd>{runPerformance?.repeated_tool_calls ?? '—'}</dd></div><div><dt>工具错误</dt><dd>{runPerformance ? `${runPerformance.tool_errors}（拒绝 ${runPerformance.safety_rejections}）` : '—'}</dd></div>{runPerformance?.termination_reason ? <div className="termination-detail"><dt>终止原因</dt><dd title={lastRun?.error ?? undefined}>{terminationLabels[runPerformance.termination_reason] ?? runPerformance.termination_reason}</dd></div> : null}<div><dt>模型</dt><dd>DeepSeek V4</dd></div><div><dt>项目路径</dt><dd title={selectedProject?.virtual_path}>{selectedProject?.virtual_path ?? '—'}</dd></div></dl></div>
             </aside>
           </div>
         )}

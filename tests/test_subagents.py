@@ -11,7 +11,10 @@ from langchain_core.messages import AIMessage, ToolMessage
 from app.backends.local_shell import LocalShellBackend
 from app.backends.workspace import Workspace
 from app.core.agent import build_agent
-from app.core.subagents import build_analysis_subagent
+from app.core.subagents import (
+    build_analysis_subagent,
+    build_reviewer_subagent,
+)
 from app.core.task_intent import TaskKind
 
 
@@ -56,6 +59,29 @@ def test_analysis_subagent_only_receives_read_tools(
     assert "SHARED_MEMORY_MARKER" in subagent[
         "system_prompt"
     ]
+
+
+def test_reviewer_subagent_is_read_only_and_requires_structured_output(
+    backend: LocalShellBackend,
+) -> None:
+    model = ToolCallingFakeModel(
+        responses=[AIMessage(content='{"findings": [], "summary": "ok"}')]
+    )
+    subagent = build_reviewer_subagent(backend, model)
+
+    assert subagent["name"] == "reviewer"
+    assert {tool.name for tool in subagent["tools"]} == {
+        "workspace_list",
+        "workspace_read",
+    }
+    assert "workspace_write" not in {
+        tool.name for tool in subagent["tools"]
+    }
+    assert "workspace_execute" not in {
+        tool.name for tool in subagent["tools"]
+    }
+    assert '"findings"' in subagent["system_prompt"]
+    assert "不得使用 workspace_write" in subagent["system_prompt"]
 
 
 def test_main_agent_can_delegate_read_only_analysis(

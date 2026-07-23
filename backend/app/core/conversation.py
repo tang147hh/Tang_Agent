@@ -6,6 +6,12 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 from app.core.task_intent import TaskKind
+from app.core.review import (
+    ReviewFindingDraft,
+    ReviewFindingSnapshot,
+    ReviewFindingStatus,
+    ReviewSeverity,
+)
 
 
 class ThreadStatus(StrEnum):
@@ -73,6 +79,30 @@ class RunSnapshot:
     error: str | None
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RunPerformanceSnapshot:
+    """与业务 run_id 一对一的预算和性能指标。"""
+
+    run_id: str
+    task_kind: TaskKind
+    max_model_calls: int
+    max_tool_calls: int
+    max_first_output_seconds: float
+    max_seconds: float
+    max_identical_tool_calls: int
+    model_calls: int
+    tool_calls: int
+    repeated_tool_calls: int
+    tool_errors: int
+    safety_rejections: int
+    first_output_ms: float | None
+    duration_ms: float | None
+    termination_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
 
 @dataclass(frozen=True, slots=True)
 class RunEventSnapshot:
@@ -178,6 +208,60 @@ class ConversationStore(
         run_id: str,
         error: str,
     ) -> RunSnapshot: ...
+
+    def initialize_run_performance(
+        self,
+        *,
+        run_id: str,
+        task_kind: TaskKind,
+        max_model_calls: int,
+        max_tool_calls: int,
+        max_first_output_seconds: float,
+        max_seconds: float,
+        max_identical_tool_calls: int,
+    ) -> RunPerformanceSnapshot: ...
+
+    def update_run_performance(
+        self,
+        *,
+        run_id: str,
+        model_calls: int,
+        tool_calls: int,
+        repeated_tool_calls: int,
+        tool_errors: int,
+        safety_rejections: int,
+        first_output_ms: float | None,
+        duration_ms: float,
+        termination_reason: str | None,
+    ) -> RunPerformanceSnapshot: ...
+
+    def get_run_performance(
+        self,
+        run_id: str,
+    ) -> RunPerformanceSnapshot | None: ...
+
+    def add_review_findings(
+        self,
+        *,
+        run_id: str,
+        findings: list[ReviewFindingDraft],
+    ) -> tuple[list[ReviewFindingSnapshot], int]: ...
+
+    def list_review_findings(
+        self,
+        run_id: str,
+        *,
+        severity: ReviewSeverity | None = None,
+        status: ReviewFindingStatus | None = None,
+    ) -> list[ReviewFindingSnapshot]: ...
+
+    def update_review_finding_status(
+        self,
+        *,
+        run_id: str,
+        finding_id: str,
+        status: ReviewFindingStatus,
+    ) -> ReviewFindingSnapshot: ...
 
     def append_message(
         self,

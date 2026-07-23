@@ -3,14 +3,23 @@ from __future__ import annotations
 from typing import Any
 
 from deepagents import FilesystemPermission, create_deep_agent
+from langchain.agents.middleware import ModelCallLimitMiddleware
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from app.backends.local_shell import LocalShellBackend
 from app.backends.task_scoped import TaskScopedBackend
 from app.core.model import make_main_model
+from app.core.middleware import (
+    RunModelCallLimitMiddleware,
+    ToolGovernanceMiddleware,
+)
 from app.core.prompt import get_system_prompt
-from app.core.subagents import build_analysis_subagent
+from app.core.subagents import (
+    build_analysis_subagent,
+    build_reviewer_subagent,
+)
 from app.core.task_intent import TaskKind
+from app.core.run_limits import budget_for
 from app.memory import WorkspaceMemoryLoader
 from app.skills import SkillCatalog
 from app.tools import build_workspace_tools
@@ -44,6 +53,9 @@ def build_agent(
     local_backend = backend or LocalShellBackend()
     main_model = model or make_main_model()
     analysis_model = subagent_model or main_model
+    budget = budget_for(task_kind)
+    model_governance = RunModelCallLimitMiddleware(budget)
+    tool_governance = ToolGovernanceMiddleware(budget)
 
     scoped_backend = TaskScopedBackend.for_task(
         task_kind,
@@ -71,6 +83,27 @@ def build_agent(
         local_backend,
         analysis_model,
         shared_context=shared_context,
+        middleware=[
+            ModelCallLimitMiddleware(
+                run_limit=budget.max_model_calls,
+                exit_behavior="error",
+            ),
+            model_governance,
+            tool_governance,
+        ],
+    )
+    reviewer_subagent = build_reviewer_subagent(
+        local_backend,
+        analysis_model,
+        shared_context=shared_context,
+        middleware=[
+            ModelCallLimitMiddleware(
+                run_limit=budget.max_model_calls,
+                exit_behavior="error",
+            ),
+            model_governance,
+            tool_governance,
+        ],
     )
 
     prompt_sections = [
@@ -90,13 +123,21 @@ def build_agent(
         model=main_model,
         tools=build_workspace_tools(scoped_backend),
         system_prompt=system_prompt,
-        subagents=[analysis_subagent],
+        subagents=[analysis_subagent, reviewer_subagent],
         permissions=[
             FilesystemPermission(
                 operations=["read", "write"],
                 paths=["/**"],
                 mode="deny",
             ),
+        ],
+        middleware=[
+            ModelCallLimitMiddleware(
+                run_limit=budget.max_model_calls,
+                exit_behavior="error",
+            ),
+            model_governance,
+            tool_governance,
         ],
         checkpointer=checkpointer,
     )

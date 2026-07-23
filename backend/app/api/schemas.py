@@ -16,6 +16,11 @@ from app.core.conversation import (
 )
 from app.core.task_intent import TaskKind
 from app.core.task_runtime import TaskStatus
+from app.core.review import (
+    ReviewCategory,
+    ReviewFindingStatus,
+    ReviewSeverity,
+)
 
 
 class TaskCreateRequest(BaseModel):
@@ -149,6 +154,53 @@ class RunResponse(BaseModel):
     error: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class RunPerformanceResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    run_id: str
+    task_kind: TaskKind
+    max_model_calls: int
+    max_tool_calls: int
+    max_first_output_seconds: float
+    max_seconds: float
+    max_identical_tool_calls: int
+    model_calls: int
+    tool_calls: int
+    repeated_tool_calls: int
+    tool_errors: int
+    safety_rejections: int
+    first_output_ms: float | None
+    duration_ms: float | None
+    termination_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReviewFindingResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    run_id: str
+    severity: ReviewSeverity
+    category: ReviewCategory
+    file_path: str | None
+    start_line: int | None
+    end_line: int | None
+    title: str
+    description: str
+    suggestion: str | None
+    status: ReviewFindingStatus
+    fingerprint: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReviewFindingStatusUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: ReviewFindingStatus
 
 
 class RunCreateRequest(BaseModel):

@@ -12,12 +12,20 @@ from app.core.conversation import (
     MessageSnapshot,
     ProjectSnapshot,
     RunSnapshot,
+    RunPerformanceSnapshot,
     RunStatus,
     ThreadSnapshot,
     ThreadStatus,
     RunEventSnapshot,
 )
 from app.core.task_intent import TaskKind
+from app.core.review import (
+    ReviewCategory,
+    ReviewFindingDraft,
+    ReviewFindingSnapshot,
+    ReviewFindingStatus,
+    ReviewSeverity,
+)
 
 
 class SQLiteProjectThreadStore:
@@ -143,6 +151,70 @@ class SQLiteProjectThreadStore:
                 """)
 
             connection.execute("""
+                CREATE TABLE IF NOT EXISTS run_performance (
+                    run_id TEXT PRIMARY KEY,
+                    task_kind TEXT NOT NULL,
+                    max_model_calls INTEGER NOT NULL,
+                    max_tool_calls INTEGER NOT NULL,
+                    max_first_output_seconds REAL NOT NULL,
+                    max_seconds REAL NOT NULL,
+                    max_identical_tool_calls INTEGER NOT NULL,
+                    model_calls INTEGER NOT NULL DEFAULT 0,
+                    tool_calls INTEGER NOT NULL DEFAULT 0,
+                    repeated_tool_calls INTEGER NOT NULL DEFAULT 0,
+                    tool_errors INTEGER NOT NULL DEFAULT 0,
+                    safety_rejections INTEGER NOT NULL DEFAULT 0,
+                    first_output_ms REAL,
+                    duration_ms REAL,
+                    termination_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id)
+                        REFERENCES runs(run_id)
+                        ON DELETE CASCADE
+                )
+                """)
+
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS review_findings (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    severity TEXT NOT NULL CHECK (
+                        severity IN ('critical', 'high', 'medium', 'low')
+                    ),
+                    category TEXT NOT NULL CHECK (
+                        category IN (
+                            'correctness', 'security', 'performance',
+                            'maintainability', 'testing', 'documentation'
+                        )
+                    ),
+                    file_path TEXT,
+                    start_line INTEGER,
+                    end_line INTEGER,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    suggestion TEXT,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('open', 'resolved', 'dismissed')
+                    ),
+                    fingerprint TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id)
+                        REFERENCES runs(run_id)
+                        ON DELETE CASCADE,
+                    CHECK (
+                        (file_path IS NULL AND start_line IS NULL
+                            AND end_line IS NULL)
+                        OR
+                        (file_path IS NOT NULL AND start_line > 0
+                            AND end_line >= start_line)
+                    ),
+                    UNIQUE (run_id, fingerprint)
+                )
+                """)
+
+            connection.execute("""
                 CREATE INDEX IF NOT EXISTS
                     idx_threads_project_updated
                 ON threads(project_id, updated_at DESC)
@@ -165,6 +237,12 @@ class SQLiteProjectThreadStore:
                 CREATE INDEX IF NOT EXISTS
                     idx_run_events_run_id_event_id
                 ON run_events(run_id, event_id)
+                """)
+
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS
+                    idx_review_findings_run_filters
+                ON review_findings(run_id, severity, status)
                 """)
 
     def create_project(
@@ -592,6 +670,249 @@ class SQLiteProjectThreadStore:
             thread_status=ThreadStatus.RUNNING,
             error=None,
         )
+
+    def initialize_run_performance(
+        self,
+        *,
+        run_id: str,
+        task_kind: TaskKind,
+        max_model_calls: int,
+        max_tool_calls: int,
+        max_first_output_seconds: float,
+        max_seconds: float,
+        max_identical_tool_calls: int,
+    ) -> RunPerformanceSnapshot:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            run = connection.execute(
+                "SELECT run_id FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Run 不存在：{run_id}")
+            connection.execute(
+                """
+                INSERT INTO run_performance (
+                    run_id, task_kind, max_model_calls, max_tool_calls,
+                    max_first_output_seconds, max_seconds,
+                    max_identical_tool_calls, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    task_kind = excluded.task_kind,
+                    max_model_calls = excluded.max_model_calls,
+                    max_tool_calls = excluded.max_tool_calls,
+                    max_first_output_seconds = excluded.max_first_output_seconds,
+                    max_seconds = excluded.max_seconds,
+                    max_identical_tool_calls = excluded.max_identical_tool_calls,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    run_id,
+                    task_kind.value,
+                    max_model_calls,
+                    max_tool_calls,
+                    max_first_output_seconds,
+                    max_seconds,
+                    max_identical_tool_calls,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM run_performance WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return self._run_performance_snapshot(row)
+
+    def update_run_performance(
+        self,
+        *,
+        run_id: str,
+        model_calls: int,
+        tool_calls: int,
+        repeated_tool_calls: int,
+        tool_errors: int,
+        safety_rejections: int,
+        first_output_ms: float | None,
+        duration_ms: float,
+        termination_reason: str | None,
+    ) -> RunPerformanceSnapshot:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE run_performance
+                SET model_calls = ?,
+                    tool_calls = ?,
+                    repeated_tool_calls = ?,
+                    tool_errors = ?,
+                    safety_rejections = ?,
+                    first_output_ms = ?,
+                    duration_ms = ?,
+                    termination_reason = ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    model_calls,
+                    tool_calls,
+                    repeated_tool_calls,
+                    tool_errors,
+                    safety_rejections,
+                    first_output_ms,
+                    duration_ms,
+                    termination_reason,
+                    now,
+                    run_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Run 性能记录不存在：{run_id}")
+            row = connection.execute(
+                "SELECT * FROM run_performance WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return self._run_performance_snapshot(row)
+
+    def get_run_performance(
+        self,
+        run_id: str,
+    ) -> RunPerformanceSnapshot | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM run_performance WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._run_performance_snapshot(row)
+
+    def add_review_findings(
+        self,
+        *,
+        run_id: str,
+        findings: list[ReviewFindingDraft],
+    ) -> tuple[list[ReviewFindingSnapshot], int]:
+        """原子写入一批已校验 Finding，重复指纹保持现有记录。"""
+
+        now = datetime.now(timezone.utc).isoformat()
+        created_count = 0
+        fingerprints = [finding.fingerprint for finding in findings]
+
+        with self._connection() as connection:
+            run = connection.execute(
+                "SELECT run_id FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Run 不存在：{run_id}")
+
+            for finding in findings:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO review_findings (
+                        id, run_id, severity, category, file_path,
+                        start_line, end_line, title, description,
+                        suggestion, status, fingerprint, created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        run_id,
+                        finding.severity.value,
+                        finding.category.value,
+                        finding.file_path,
+                        finding.start_line,
+                        finding.end_line,
+                        finding.title,
+                        finding.description,
+                        finding.suggestion,
+                        ReviewFindingStatus.OPEN.value,
+                        finding.fingerprint,
+                        now,
+                        now,
+                    ),
+                )
+                created_count += cursor.rowcount
+
+            if not fingerprints:
+                rows: list[sqlite3.Row] = []
+            else:
+                placeholders = ",".join("?" for _ in fingerprints)
+                rows = connection.execute(
+                    f"""
+                    SELECT * FROM review_findings
+                    WHERE run_id = ?
+                    AND fingerprint IN ({placeholders})
+                    """,
+                    (run_id, *fingerprints),
+                ).fetchall()
+
+        snapshots = [self._review_finding_snapshot(row) for row in rows]
+        return self._sort_review_findings(snapshots), created_count
+
+    def list_review_findings(
+        self,
+        run_id: str,
+        *,
+        severity: ReviewSeverity | None = None,
+        status: ReviewFindingStatus | None = None,
+    ) -> list[ReviewFindingSnapshot]:
+        clauses = ["run_id = ?"]
+        parameters: list[str] = [run_id]
+        if severity is not None:
+            clauses.append("severity = ?")
+            parameters.append(severity.value)
+        if status is not None:
+            clauses.append("status = ?")
+            parameters.append(status.value)
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM review_findings
+                WHERE {' AND '.join(clauses)}
+                ORDER BY
+                    CASE severity
+                        WHEN 'critical' THEN 1
+                        WHEN 'high' THEN 2
+                        WHEN 'medium' THEN 3
+                        WHEN 'low' THEN 4
+                    END,
+                    COALESCE(file_path, ''),
+                    COALESCE(start_line, 0),
+                    created_at,
+                    id
+                """,
+                parameters,
+            ).fetchall()
+        return [self._review_finding_snapshot(row) for row in rows]
+
+    def update_review_finding_status(
+        self,
+        *,
+        run_id: str,
+        finding_id: str,
+        status: ReviewFindingStatus,
+    ) -> ReviewFindingSnapshot:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE review_findings
+                SET status = ?, updated_at = ?
+                WHERE run_id = ? AND id = ?
+                """,
+                (status.value, now, run_id, finding_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Review Finding 不存在：{finding_id}")
+            row = connection.execute(
+                "SELECT * FROM review_findings WHERE id = ?",
+                (finding_id,),
+            ).fetchone()
+        return self._review_finding_snapshot(row)
 
     def complete_run(
         self,
@@ -1114,4 +1435,86 @@ class SQLiteProjectThreadStore:
             created_at=datetime.fromisoformat(
                 row["created_at"]
             ),
+        )
+
+    @staticmethod
+    def _review_finding_snapshot(
+        row: sqlite3.Row | None,
+    ) -> ReviewFindingSnapshot:
+        if row is None:
+            raise RuntimeError("Review Finding 记录读取失败")
+        return ReviewFindingSnapshot(
+            id=str(row["id"]),
+            run_id=str(row["run_id"]),
+            severity=ReviewSeverity(row["severity"]),
+            category=ReviewCategory(row["category"]),
+            file_path=row["file_path"],
+            start_line=row["start_line"],
+            end_line=row["end_line"],
+            title=str(row["title"]),
+            description=str(row["description"]),
+            suggestion=row["suggestion"],
+            status=ReviewFindingStatus(row["status"]),
+            fingerprint=str(row["fingerprint"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _sort_review_findings(
+        findings: list[ReviewFindingSnapshot],
+    ) -> list[ReviewFindingSnapshot]:
+        severity_order = {
+            ReviewSeverity.CRITICAL: 1,
+            ReviewSeverity.HIGH: 2,
+            ReviewSeverity.MEDIUM: 3,
+            ReviewSeverity.LOW: 4,
+        }
+        return sorted(
+            findings,
+            key=lambda finding: (
+                severity_order[finding.severity],
+                finding.file_path or "",
+                finding.start_line or 0,
+                finding.created_at,
+                finding.id,
+            ),
+        )
+
+    @staticmethod
+    def _run_performance_snapshot(
+        row: sqlite3.Row | None,
+    ) -> RunPerformanceSnapshot:
+        if row is None:
+            raise RuntimeError("Run 性能记录读取失败")
+        return RunPerformanceSnapshot(
+            run_id=str(row["run_id"]),
+            task_kind=TaskKind(row["task_kind"]),
+            max_model_calls=int(row["max_model_calls"]),
+            max_tool_calls=int(row["max_tool_calls"]),
+            max_first_output_seconds=float(
+                row["max_first_output_seconds"]
+            ),
+            max_seconds=float(row["max_seconds"]),
+            max_identical_tool_calls=int(
+                row["max_identical_tool_calls"]
+            ),
+            model_calls=int(row["model_calls"]),
+            tool_calls=int(row["tool_calls"]),
+            repeated_tool_calls=int(row["repeated_tool_calls"]),
+            tool_errors=int(row["tool_errors"]),
+            safety_rejections=int(row["safety_rejections"]),
+            first_output_ms=(
+                float(row["first_output_ms"])
+                if row["first_output_ms"] is not None
+                else None
+            ),
+            duration_ms=(
+                float(row["duration_ms"])
+                if row["duration_ms"] is not None
+                else None
+            ),
+            termination_reason=row["termination_reason"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
         )

@@ -962,6 +962,11 @@ button:disabled {
   margin: 0;
 }
 
+.run-details .termination-detail dd {
+  color: #b42318;
+  font-weight: 600;
+}
+
 .run-details dd {
   overflow: hidden;
   color: #46536a;

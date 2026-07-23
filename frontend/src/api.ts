@@ -15,6 +15,8 @@ export const runEventKinds = [
   'tool_finished',
   'completed',
   'failed',
+  'terminated',
+  'review_findings_saved',
 ] as const
 
 export type ThreadStatus = (typeof threadStatuses)[number]
@@ -22,6 +24,15 @@ export type RunStatus = (typeof runStatuses)[number]
 export type MessageRole = (typeof messageRoles)[number]
 export type RunEventKind = (typeof runEventKinds)[number]
 export type TaskKind = 'coding' | 'analysis' | 'planning' | 'qa'
+export type ReviewSeverity = 'critical' | 'high' | 'medium' | 'low'
+export type ReviewCategory =
+  | 'correctness'
+  | 'security'
+  | 'performance'
+  | 'maintainability'
+  | 'testing'
+  | 'documentation'
+export type ReviewFindingStatus = 'open' | 'resolved' | 'dismissed'
 
 export interface Project {
   project_id: string
@@ -63,6 +74,43 @@ export interface Run {
 export interface RunStartResponse {
   run: Run
   message: Message
+}
+
+export interface RunPerformance {
+  run_id: string
+  task_kind: TaskKind
+  max_model_calls: number
+  max_tool_calls: number
+  max_first_output_seconds: number
+  max_seconds: number
+  max_identical_tool_calls: number
+  model_calls: number
+  tool_calls: number
+  repeated_tool_calls: number
+  tool_errors: number
+  safety_rejections: number
+  first_output_ms: number | null
+  duration_ms: number | null
+  termination_reason: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ReviewFinding {
+  id: string
+  run_id: string
+  severity: ReviewSeverity
+  category: ReviewCategory
+  file_path: string | null
+  start_line: number | null
+  end_line: number | null
+  title: string
+  description: string
+  suggestion: string | null
+  status: ReviewFindingStatus
+  fingerprint: string
+  created_at: string
+  updated_at: string
 }
 
 export interface SkillSummary {
@@ -107,13 +155,27 @@ export interface RunEventPayload {
   run_id: string
   source: string
   created_at: string
-  status?: RunStatus
+  status?: RunStatus | 'error'
   task_kind?: TaskKind
   text?: string
   name?: string
   tool_call_id?: string
   subagent?: string
   error?: string
+  recoverable?: boolean
+  termination_reason?: string
+  created_count?: number
+  duplicate_count?: number
+  rejected_count?: number
+  summary?: string
+  budget?: Pick<
+    RunPerformance,
+    | 'max_model_calls'
+    | 'max_tool_calls'
+    | 'max_first_output_seconds'
+    | 'max_seconds'
+    | 'max_identical_tool_calls'
+  >
 }
 
 async function requestJson<T>(
@@ -195,6 +257,36 @@ export function listRuns(threadId: string): Promise<Run[]> {
 
 export function getRun(runId: string): Promise<Run> {
   return requestJson<Run>(`/api/runs/${encodeURIComponent(runId)}`)
+}
+
+export function getRunPerformance(runId: string): Promise<RunPerformance | null> {
+  return requestJson<RunPerformance | null>(
+    `/api/runs/${encodeURIComponent(runId)}/performance`,
+  )
+}
+
+export function listReviewFindings(
+  runId: string,
+  filters: { severity?: ReviewSeverity; status?: ReviewFindingStatus } = {},
+): Promise<ReviewFinding[]> {
+  const query = new URLSearchParams()
+  if (filters.severity) query.set('severity', filters.severity)
+  if (filters.status) query.set('status', filters.status)
+  const suffix = query.size ? `?${query.toString()}` : ''
+  return requestJson<ReviewFinding[]>(
+    `/api/runs/${encodeURIComponent(runId)}/review-findings${suffix}`,
+  )
+}
+
+export function updateReviewFindingStatus(
+  runId: string,
+  findingId: string,
+  status: ReviewFindingStatus,
+): Promise<ReviewFinding> {
+  return requestJson<ReviewFinding>(
+    `/api/runs/${encodeURIComponent(runId)}/review-findings/${encodeURIComponent(findingId)}`,
+    jsonRequest('PATCH', { status }),
+  )
 }
 
 export function startRun(

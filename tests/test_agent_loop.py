@@ -13,6 +13,7 @@ from app.backends.local_shell import LocalShellBackend
 from app.backends.task_scoped import TaskScopedBackend
 from app.backends.workspace import Workspace
 from app.core.agent import build_agent
+from app.core.run_limits import RunLimitExceeded, RunTerminationReason
 from app.core.task_intent import TaskKind
 from app.tools import build_workspace_tools
 
@@ -248,6 +249,58 @@ def test_deep_agent_recovers_from_rejected_command(
     assert result["messages"][-1].content == "文件内容验证完成"
 
 
+def test_deep_agent_recovers_from_missing_file_error(
+    backend: LocalShellBackend,
+) -> None:
+    model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_read",
+                        "args": {
+                            "path": "/projects/demo/missing.md",
+                            "offset": 0,
+                            "limit": 100,
+                        },
+                        "id": "call_missing",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="文件不存在，已停止读取并继续回答"),
+        ]
+    )
+    agent = build_agent(
+        TaskKind.ANALYSIS,
+        backend=backend,
+        model=model,
+    )
+
+    result = agent.invoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "读取不存在的文件后继续处理",
+                }
+            ]
+        }
+    )
+    tool_message = next(
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage)
+    )
+
+    assert tool_message.status == "error"
+    assert '"recoverable": true' in str(tool_message.content)
+    assert result["messages"][-1].content == (
+        "文件不存在，已停止读取并继续回答"
+    )
+
+
 def test_deep_agent_completes_tool_loop(
     backend: LocalShellBackend,
 ) -> None:
@@ -306,3 +359,72 @@ def test_deep_agent_completes_tool_loop(
         and "hello from Tang Agent" in str(message.content)
         for message in result["messages"]
     )
+
+
+def test_model_budget_is_shared_with_subagent(
+    backend: LocalShellBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TANG_AGENT_CODING_MAX_MODEL_CALLS", "2")
+    backend.write_text(
+        "/projects/demo/README.md",
+        "shared budget\n",
+    )
+    parent_model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "读取 README",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "call_subagent",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+    child_model = ToolCallingFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_read",
+                        "args": {
+                            "path": "/projects/demo/README.md",
+                            "offset": 0,
+                            "limit": 100,
+                        },
+                        "id": "call_read",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="不会执行到这里"),
+        ]
+    )
+    agent = build_agent(
+        TaskKind.CODING,
+        backend=backend,
+        model=parent_model,
+        subagent_model=child_model,
+    )
+
+    with pytest.raises(RunLimitExceeded) as error:
+        agent.invoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "委派子 Agent 读取 README",
+                    }
+                ]
+            }
+        )
+
+    assert error.value.reason is RunTerminationReason.MODEL_CALL_LIMIT

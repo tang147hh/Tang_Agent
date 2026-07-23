@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
+from functools import lru_cache
 
 from fastapi import FastAPI
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from app.backends.workspace import Workspace
+from app.backends.local_shell import LocalShellBackend
 from app.api.routes import router
 from app.core.agent import build_agent
 from app.core.conversation import ConversationStore
 from app.core.config import Settings, load_settings
 from app.core.logging_config import configure_logging
+from app.core.model import make_main_model
 from app.core.task_runtime import (
     AgentFactory,
     TaskRegistry,
@@ -87,12 +90,22 @@ def create_app(
             checkpointer = SqliteSaver(
                 checkpoint_connection
             )
+            shared_backend = LocalShellBackend(active_workspace)
+
+            @lru_cache(maxsize=1)
+            def shared_model():
+                """模型客户端无 Run 状态，可以在进程内安全复用。"""
+
+                return make_main_model(current_settings)
 
             def persistent_agent_factory(
                 task_kind,
             ):
                 return build_agent(
                     task_kind,
+                    backend=shared_backend,
+                    model=shared_model(),
+                    subagent_model=shared_model(),
                     checkpointer=checkpointer,
                 )
 

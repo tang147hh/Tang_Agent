@@ -15,7 +15,17 @@ from langchain_core.messages import (
     ToolMessage,
     ToolMessageChunk,
 )
+from langchain.agents.middleware.model_call_limit import (
+    ModelCallLimitExceededError,
+)
 
+from app.core.run_limits import (
+    RunBudgetTracker,
+    RunLimitExceeded,
+    RunTerminationReason,
+    budget_for,
+    iter_with_deadline,
+)
 from app.core.task_intent import TaskKind
 
 logger = logging.getLogger("app.task_runtime")
@@ -388,6 +398,8 @@ def run_agent_task(
     """流式执行 Agent，并持久化标准化任务事件。"""
 
     task = task_store.mark_running(thread_id)
+    budget = budget_for(task.task_kind)
+    tracker = RunBudgetTracker(budget)
 
     task_store.append_event(
         thread_id=thread_id,
@@ -395,6 +407,17 @@ def run_agent_task(
         source="system",
         payload={
             "status": TaskStatus.RUNNING.value,
+            "budget": {
+                "max_model_calls": budget.max_model_calls,
+                "max_tool_calls": budget.max_tool_calls,
+                "max_first_output_seconds": (
+                    budget.max_first_output_seconds
+                ),
+                "max_seconds": budget.max_seconds,
+                "max_identical_tool_calls": (
+                    budget.max_identical_tool_calls
+                ),
+            },
         },
     )
 
@@ -447,7 +470,8 @@ def run_agent_task(
             version="v2",
         )
 
-        for part in stream:
+        tool_call_index = 0
+        for part in iter_with_deadline(stream, tracker):
             if not isinstance(part, dict):
                 continue
 
@@ -464,6 +488,12 @@ def run_agent_task(
             source = _stream_source(part.get("ns", ()))
 
             tool_names = _tool_names(message)
+            text = _message_text(message)
+            tracker.observe_model_message(
+                message,
+                source=source,
+                has_output=bool(tool_names or text),
+            )
 
             # 工具事件前先把已有正文写出，
             # 保证数据库中的事件顺序正确。
@@ -471,6 +501,13 @@ def run_agent_task(
                 flush_text()
 
                 for tool_name in tool_names:
+                    tool_call_index += 1
+                    tracker.observe_tool_call(
+                        source=source,
+                        name=tool_name,
+                        arguments=None,
+                        call_id=f"legacy:{tool_call_index}",
+                    )
                     task_store.append_event(
                         thread_id=thread_id,
                         kind="tool_started",
@@ -498,8 +535,6 @@ def run_agent_task(
                 )
 
                 continue
-
-            text = _message_text(message)
 
             # 带工具调用的 AIMessage 不算最终回答正文。
             if (
@@ -543,6 +578,34 @@ def run_agent_task(
             source="system",
             payload={
                 "status": TaskStatus.COMPLETED.value,
+            },
+        )
+    except ModelCallLimitExceededError:
+        limit = RunLimitExceeded(
+            RunTerminationReason.MODEL_CALL_LIMIT,
+            "Run 已达到模型调用预算，已停止继续推理。",
+        )
+        task_store.fail(thread_id, limit.user_message)
+        task_store.append_event(
+            thread_id=thread_id,
+            kind="terminated",
+            source="system",
+            payload={
+                "status": TaskStatus.FAILED.value,
+                "termination_reason": limit.reason.value,
+                "error": limit.user_message,
+            },
+        )
+    except RunLimitExceeded as limit:
+        task_store.fail(thread_id, limit.user_message)
+        task_store.append_event(
+            thread_id=thread_id,
+            kind="terminated",
+            source="system",
+            payload={
+                "status": TaskStatus.FAILED.value,
+                "termination_reason": limit.reason.value,
+                "error": limit.user_message,
             },
         )
     except Exception:
