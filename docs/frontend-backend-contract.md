@@ -469,20 +469,50 @@ SSE 用于过程展示，GET 接口返回的数据是最终权威状态。
 
 ### 9.7 Skills 页面
 
-当前后端尚无 Skills API。第一版前端先实现：
+Skills 页面使用两个只读接口。
 
-- 左侧 Skills 导航入口。
-- Skills 页面布局。
-- 后端尚未接入时的空状态。
-
-后续至少需要增加：
+获取 Skill 摘要列表：
 
 ```http
 GET /api/skills
+```
+
+响应：
+
+```json
+[
+  {
+    "name": "repo-analysis",
+    "description": "分析陌生代码仓库",
+    "path": "/skills/repo-analysis/SKILL.md"
+  }
+]
+```
+
+列表响应不包含完整正文。用户选中 Skill 后再请求详情：
+
+```http
 GET /api/skills/{skill_name}
 ```
 
-第一阶段 Skills 页面建议展示名称、简介、来源、可用状态、`SKILL.md` 内容预览，并支持搜索和筛选。
+详情响应：
+
+```json
+{
+  "name": "repo-analysis",
+  "description": "分析陌生代码仓库",
+  "path": "/skills/repo-analysis/SKILL.md",
+  "content": "# Repository Analysis"
+}
+```
+
+约束：
+
+- 所有路径都是 `/skills/...` 虚拟路径，不暴露真实磁盘路径。
+- Skill 不存在时返回 `404 Not Found`。
+- Skill 名称不合法时返回 `422 Unprocessable Content`。
+- 当前接口只支持查看，不支持创建、编辑或删除 Skill。
+- 前端列表支持搜索、选择、加载状态、错误重试和 Markdown 正文预览。
 
 ## 10. 当前缺失能力
 
@@ -504,7 +534,7 @@ GET /api/skills/{skill_name}
 | 子 Agent 步骤 | 已支持，按 `source` 区分来源 |
 | 取消 Run | 未支持 |
 | 专用重试接口 | 未支持 |
-| Skills 列表与详情 | 未支持 |
+| Skills 列表与详情 | 已支持，只读 |
 | GitHub 仓库、分支和 PR | 未支持 |
 | 文件或图片上传 | 未支持 |
 | 历史分页 | 未支持 |
@@ -518,8 +548,8 @@ GET /api/skills/{skill_name}
 5. 实现消息历史和底部输入框。
 6. 接入 Run SSE 和临时 Assistant 消息。
 7. 实现步骤列表、运行状态和完成项划线。
-8. 增加 Skills 页面入口与空状态。
-9. 补充 Skills 和 GitHub 所需后端接口。
+8. 接入 Skills 列表、详情和 Markdown 预览。
+9. 补充 GitHub 仓库、Fetch、分支和 PR 所需接口。
 
 ## 12. 当前结论
 
@@ -535,4 +565,4 @@ GET /api/skills/{skill_name}
 → 终态后刷新 Run 与消息快照
 ```
 
-下一阶段补齐 Skills 列表/详情 API，再进入 GitHub clone、分支、commit、push 和 Pull Request 闭环。
+下一阶段进入 GitHub 仓库发现、clone、fetch、分支、commit、push 和 Pull Request 闭环。
