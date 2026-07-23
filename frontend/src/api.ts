@@ -1,18 +1,13 @@
-export const taskKinds = [
-  'qa',
-  'planning',
-  'analysis',
-  'development',
-] as const
-
-export const taskStatuses = [
+export const threadStatuses = ['idle', 'running', 'error'] as const
+export const runStatuses = [
   'pending',
   'running',
   'completed',
   'failed',
+  'cancelled',
 ] as const
-
-export const taskEventKinds = [
+export const messageRoles = ['user', 'assistant', 'system'] as const
+export const runEventKinds = [
   'created',
   'running',
   'token',
@@ -22,27 +17,57 @@ export const taskEventKinds = [
   'failed',
 ] as const
 
-export type TaskKind = (typeof taskKinds)[number]
-export type TaskStatus = (typeof taskStatuses)[number]
-export type TaskEventKind = (typeof taskEventKinds)[number]
+export type ThreadStatus = (typeof threadStatuses)[number]
+export type RunStatus = (typeof runStatuses)[number]
+export type MessageRole = (typeof messageRoles)[number]
+export type RunEventKind = (typeof runEventKinds)[number]
 
-export interface TaskResponse {
+export interface Project {
+  project_id: string
+  name: string
+  virtual_path: string
+  created_at: string
+  updated_at: string
+}
+
+export interface Thread {
   thread_id: string
-  prompt: string
-  task_kind: TaskKind
-  status: TaskStatus
-  result: string | null
+  project_id: string
+  title: string
+  status: ThreadStatus
+  created_at: string
+  updated_at: string
+}
+
+export interface Message {
+  sequence: number
+  message_id: string
+  thread_id: string
+  run_id: string | null
+  role: MessageRole
+  content: string
+  created_at: string
+}
+
+export interface Run {
+  run_id: string
+  thread_id: string
+  status: RunStatus
   error: string | null
   created_at: string
   updated_at: string
 }
 
-export interface TaskEventPayload {
-  thread_id: string
+export interface RunStartResponse {
+  run: Run
+  message: Message
+}
+
+export interface RunEventPayload {
+  run_id: string
   source: string
   created_at: string
-  status?: TaskStatus
-  task_kind?: TaskKind
+  status?: RunStatus
   text?: string
   name?: string
   error?: string
@@ -77,20 +102,65 @@ async function requestJson<T>(
   return response.json() as Promise<T>
 }
 
-export function createTask(prompt: string): Promise<TaskResponse> {
-  return requestJson<TaskResponse>('/api/tasks', {
-    method: 'POST',
+function jsonRequest(method: string, body: unknown): RequestInit {
+  return {
+    method,
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ prompt }),
-  })
+    body: JSON.stringify(body),
+  }
 }
 
-export function getTask(threadId: string): Promise<TaskResponse> {
-  return requestJson<TaskResponse>(`/api/tasks/${encodeURIComponent(threadId)}`)
+export function listProjects(): Promise<Project[]> {
+  return requestJson<Project[]>('/api/projects')
 }
 
-export function taskEventsUrl(threadId: string): string {
-  return `/api/tasks/${encodeURIComponent(threadId)}/events`
+export function createProject(input: {
+  name: string
+  virtual_path: string
+}): Promise<Project> {
+  return requestJson<Project>('/api/projects', jsonRequest('POST', input))
+}
+
+export function listThreads(projectId: string): Promise<Thread[]> {
+  return requestJson<Thread[]>(
+    `/api/projects/${encodeURIComponent(projectId)}/threads`,
+  )
+}
+
+export function createThread(projectId: string, title = '新对话'): Promise<Thread> {
+  return requestJson<Thread>(
+    `/api/projects/${encodeURIComponent(projectId)}/threads`,
+    jsonRequest('POST', { title }),
+  )
+}
+
+export function getThread(threadId: string): Promise<Thread> {
+  return requestJson<Thread>(`/api/threads/${encodeURIComponent(threadId)}`)
+}
+
+export function listMessages(threadId: string): Promise<Message[]> {
+  return requestJson<Message[]>(
+    `/api/threads/${encodeURIComponent(threadId)}/messages`,
+  )
+}
+
+export function listRuns(threadId: string): Promise<Run[]> {
+  return requestJson<Run[]>(`/api/threads/${encodeURIComponent(threadId)}/runs`)
+}
+
+export function getRun(runId: string): Promise<Run> {
+  return requestJson<Run>(`/api/runs/${encodeURIComponent(runId)}`)
+}
+
+export function startRun(threadId: string, content: string): Promise<RunStartResponse> {
+  return requestJson<RunStartResponse>(
+    `/api/threads/${encodeURIComponent(threadId)}/runs`,
+    jsonRequest('POST', { content }),
+  )
+}
+
+export function runEventsUrl(runId: string): string {
+  return `/api/runs/${encodeURIComponent(runId)}/events`
 }

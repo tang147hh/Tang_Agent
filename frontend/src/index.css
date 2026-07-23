@@ -1,24 +1,25 @@
 :root {
-  --bg: #0c0e13;
-  --panel: #14171f;
-  --field: #0f1218;
-  --chip: #20242e;
-  --line: #292e3a;
-  --text-strong: #f3f4f8;
-  --text: #c8ccd6;
-  --text-muted: #969dac;
-  --text-faint: #697080;
-  --accent: #806cff;
-  --success: #4dd997;
-  --danger: #ff6868;
-  --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --surface-soft: #f8fafc;
+  --surface-hover: #f2f6fd;
+  --border: #e2e7ef;
+  --border-strong: #d5dce7;
+  --text: #172033;
+  --text-soft: #536077;
+  --text-muted: #8792a5;
+  --blue: #1468f5;
+  --blue-soft: #eaf2ff;
+  --green: #17b978;
+  --red: #e5484d;
+  --orange: #ff8a34;
+  --purple: #7c4dff;
+  --shadow: 0 14px 40px rgba(29, 43, 70, 0.1);
+  --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", sans-serif;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 
   color: var(--text);
-  background:
-    radial-gradient(circle at 12% -10%, rgba(128, 108, 255, 0.15), transparent 30%),
-    radial-gradient(circle at 92% 8%, rgba(77, 217, 151, 0.07), transparent 22%),
-    var(--bg);
+  background: var(--bg);
   font-family: var(--sans);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -30,24 +31,37 @@
   box-sizing: border-box;
 }
 
-html {
+html,
+body,
+#root {
   min-width: 320px;
   min-height: 100%;
-  background: var(--bg);
-}
-
-body {
-  min-width: 320px;
-  min-height: 100vh;
   margin: 0;
 }
 
+body {
+  min-height: 100vh;
+  overflow: hidden;
+}
+
 button,
+input,
 textarea {
   font: inherit;
 }
 
+button {
+  color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid rgba(20, 104, 245, 0.18);
+  outline-offset: 2px;
+}
+
 ::selection {
-  background: rgba(128, 108, 255, 0.32);
   color: #fff;
+  background: var(--blue);
 }

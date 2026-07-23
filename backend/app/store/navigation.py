@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -340,7 +341,7 @@ class SQLiteProjectThreadStore:
         with self._connection() as connection:
             thread = connection.execute(
                 """
-                SELECT thread_id
+                SELECT thread_id, title
                 FROM threads
                 WHERE thread_id = ?
                 """,
@@ -349,6 +350,12 @@ class SQLiteProjectThreadStore:
 
             if thread is None:
                 raise KeyError(f"会话不存在：{thread_id}")
+
+            title = str(thread["title"])
+            if title == "新对话":
+                title = self._title_from_first_message(
+                    normalized_content,
+                )
 
             try:
                 connection.execute(
@@ -400,11 +407,13 @@ class SQLiteProjectThreadStore:
                 """
                 UPDATE threads
                 SET status = ?,
+                    title = ?,
                     updated_at = ?
                 WHERE thread_id = ?
                 """,
                 (
                     ThreadStatus.RUNNING.value,
+                    title,
                     now,
                     thread_id,
                 ),
@@ -432,6 +441,20 @@ class SQLiteProjectThreadStore:
             self._run_snapshot(run_row),
             self._message_snapshot(message_row),
         )
+
+    @staticmethod
+    def _title_from_first_message(content: str) -> str:
+        """从首条消息生成稳定、可检索的会话标题。"""
+        first_line = content.splitlines()[0]
+        title = re.sub(r"[`#>*_~\[\]()]+", " ", first_line)
+        title = re.sub(r"\s+", " ", title).strip(" ，。！？!?：:；;-—")
+        for prefix in ("请帮我", "麻烦帮我", "帮我", "请", "我想要", "我想"):
+            if title.startswith(prefix) and len(title) > len(prefix) + 2:
+                title = title[len(prefix):].lstrip(" ，。:：")
+                break
+        if len(title) > 28:
+            title = title[:28].rstrip() + "…"
+        return title or "新对话"
 
     def create_run(
         self,
